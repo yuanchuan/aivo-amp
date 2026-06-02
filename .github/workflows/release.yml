@@ -1,0 +1,73 @@
+name: release
+
+# Push a version tag (e.g. `git tag v0.1.0 && git push --tags`) to cross-compile
+# a binary for each supported OS/arch and attach it to the GitHub release that
+# `aivo plugins install github:yuanchuan/aivo-amp` downloads from.
+#
+# NOTE: this builds standalone, so the committed Cargo.toml must use the `aivo`
+# *git* dependency (not the `../aivo` path), pinned to a published rev/tag whose
+# `serve_router` usage helpers are `pub`. See Cargo.toml.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin,      os: macos-latest }
+          - { target: x86_64-apple-darwin,       os: macos-latest }
+          - { target: x86_64-unknown-linux-gnu,  os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-latest, apt: gcc-aarch64-linux-gnu, linker: aarch64-linux-gnu-gcc }
+          - { target: x86_64-pc-windows-msvc,    os: windows-latest }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup update stable --no-self-update && rustup target add ${{ matrix.target }}
+
+      # Only the aarch64-linux row needs a cross-linker; everything else builds
+      # natively. The `ring` crate (pulled in by rustls) auto-detects the matching
+      # `aarch64-linux-gnu-gcc` cross C compiler from this package.
+      - name: Install cross linker
+        if: matrix.apt != ''
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
+
+      - name: Build
+        shell: bash
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # Publish the bare binary, named with its target triple. aivo's installer
+      # detects the host (os, arch), picks the asset whose name carries the
+      # matching triple, and `chmod +x`es it — no archive to extract.
+      - name: Package
+        id: pkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="target/${{ matrix.target }}/release"
+          out="aivo-amp-${{ matrix.target }}"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "$src/aivo-amp.exe" "$out.exe"
+            echo "asset=$out.exe" >> "$GITHUB_OUTPUT"
+          else
+            cp "$src/aivo-amp" "$out"
+            echo "asset=$out" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.pkg.outputs.asset }}

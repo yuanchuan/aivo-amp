@@ -1,0 +1,8 @@
+# Pin the toolchain channel + components so every contributor (and CI) runs
+# the same fmt/clippy. Uses latest stable rather than an exact version: the
+# crate targets 1.88 as its MSRV (see Cargo.toml) but builds on current
+# stable. Bump to an exact version like "1.95.0" if you need byte-reproducible
+# builds.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
