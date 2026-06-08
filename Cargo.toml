@@ -1,13 +1,11 @@
 [package]
 name = "aivo-amp"
 version = "0.1.0"
-# MSRV: 1.88 is the real floor (let-chains stabilized there); edition 2024
-# needs 1.85. Verified to build + test on 1.88.0, so don't bump without a
-# reason. Source uses no API newer than 1.88. Note: the pinned `aivo` rev
-# declares rust-version = 1.95, but it still compiles on 1.88 (CI's `msrv`
-# job guards this) — re-check when bumping the aivo rev below.
+# MSRV: 1.95 — the floor the pinned `aivo` dep declares (`rust-version =
+# "1.95"`), so it's the effective floor for the whole build. Edition 2024 needs
+# 1.85; CI's `msrv` job builds on 1.95.0 to guard this.
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.95"
 authors = ["yuanchuan"]
 description = "Sourcegraph Amp support for aivo, as a sibling-binary plugin (aivo amp …)"
 license = "MIT"
