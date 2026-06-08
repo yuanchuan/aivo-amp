@@ -21,30 +21,15 @@ pub struct AmpModeModels {
     pub disable_tools: Vec<String>,
     /// `--mode <smart|rush|deep|large>`: pin the initial agent mode for
     /// this thread. Amp locks the agent mode after the first message
-    /// lands, so this only applies before the first send. Bare flag
-    /// (`Some("")`) requests an interactive picker.
+    /// lands, so this only applies before the first send.
     pub initial_mode: Option<String>,
 }
 
-/// Canonical amp agent modes. Order matches both amp's own catalog
-/// (rush/smart/deep/large) and the JSON object emitted to
-/// `internal.model`. Used for `--mode` validation and the picker UI.
-pub const AMP_AGENT_MODES: [(&str, &str); 4] = [
-    ("smart", "Default — most capable model + tools"),
-    ("rush", "Fast/cheap for small, well-defined tasks"),
-    ("deep", "Deep reasoning"),
-    ("large", "Biggest context window (1M)"),
-];
+/// Canonical amp agent modes (order matches amp's own catalog). Used for
+/// `--mode` validation.
+pub const AMP_AGENT_MODES: [&str; 4] = ["smart", "rush", "deep", "large"];
 
 impl AmpModeModels {
-    /// True when at least one per-mode slot was passed bare (empty string),
-    /// meaning the caller wants an interactive picker.
-    pub fn has_any_picker_request(&self) -> bool {
-        [&self.rush, &self.smart, &self.deep, &self.large]
-            .iter()
-            .any(|v| matches!(v, Some(s) if s.is_empty()))
-    }
-
     /// Renders the override as the JSON object form amp expects:
     /// `{"<mode>": "<provider>:<model>", ...}`. Modes with no override
     /// are omitted; if the user's value lacks a `provider:` prefix we

@@ -50,20 +50,20 @@ pub struct LaunchCli {
     pub model: Option<String>,
 
     /// Pin the initial agent mode: smart | rush | deep | large.
-    #[arg(long = "mode", num_args = 0..=1, default_missing_value = "", value_name = "MODE")]
+    #[arg(long = "mode", value_name = "MODE")]
     pub mode: Option<String>,
 
     /// Per-mode model override for `rush`.
-    #[arg(long = "rush-model", num_args = 0..=1, default_missing_value = "", value_name = "MODEL")]
+    #[arg(long = "rush-model", value_name = "MODEL")]
     pub rush_model: Option<String>,
     /// Per-mode model override for `smart`.
-    #[arg(long = "smart-model", num_args = 0..=1, default_missing_value = "", value_name = "MODEL")]
+    #[arg(long = "smart-model", value_name = "MODEL")]
     pub smart_model: Option<String>,
     /// Per-mode model override for `deep`.
-    #[arg(long = "deep-model", num_args = 0..=1, default_missing_value = "", value_name = "MODEL")]
+    #[arg(long = "deep-model", value_name = "MODEL")]
     pub deep_model: Option<String>,
     /// Per-mode model override for `large`.
-    #[arg(long = "large-model", num_args = 0..=1, default_missing_value = "", value_name = "MODEL")]
+    #[arg(long = "large-model", value_name = "MODEL")]
     pub large_model: Option<String>,
 
     /// Strip a tool from amp's request to the upstream (repeatable).

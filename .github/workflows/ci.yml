@@ -20,6 +20,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # aivo-amp links the aivo lib via a path dep (`../aivo` in Cargo.toml) for
+      # co-dev, and CI runners have no sibling checkout — so clone aivo's main
+      # next to the workspace. aivo is public, so no token is needed. Once
+      # Cargo.toml pins the git dep (a release tag), drop this step: cargo
+      # fetches the pinned dep itself, same as release.yml.
+      - name: Clone sibling aivo (path dependency)
+        run: git clone --depth 1 https://github.com/yuanchuan/aivo ../aivo
+
       - name: Install toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -44,6 +52,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Clone sibling aivo (path dependency)
+        run: git clone --depth 1 https://github.com/yuanchuan/aivo ../aivo
+
       # Keep this version in sync with `rust-version` in Cargo.toml.
       - name: Install MSRV toolchain
         uses: dtolnay/rust-toolchain@1.88.0
@@ -51,7 +62,8 @@ jobs:
       - name: Cache cargo + target
         uses: Swatinem/rust-cache@v2
 
-      # `+1.88.0` overrides rust-toolchain.toml (which pins stable) so this
-      # job actually exercises the declared MSRV.
+      # `+1.88.0` overrides rust-toolchain.toml (which pins stable) so this job
+      # actually exercises the declared MSRV. No `--locked`: the lockfile can't
+      # pin a path dep against a moving sibling.
       - name: Build
-        run: cargo +1.88.0 build --locked
+        run: cargo +1.88.0 build

@@ -157,34 +157,15 @@ async fn launch_amp(launch: cli::LaunchCli) -> anyhow::Result<i32> {
         unsafe { std::env::set_var("AIVO_AMP_PASSTHROUGH", "1") };
     }
 
-    // Validate mode flags up front (matches aivo's run.rs gate).
+    // Validate the initial mode up front (matches aivo's run.rs gate).
     let modes = launch.to_mode_models();
-    if modes.has_any_picker_request() {
+    if let Some(mode) = modes.initial_mode.as_deref().map(str::trim)
+        && !AMP_AGENT_MODES.contains(&mode)
+    {
         anyhow::bail!(
-            "specify a model for the per-mode flag, e.g. `--smart-model gpt-5.5-pro` (interactive per-mode picker isn't available in the amp plugin yet)"
+            "unknown --mode '{mode}'. Valid: {}",
+            AMP_AGENT_MODES.join(", ")
         );
-    }
-    if let Some(mode) = modes.initial_mode.as_deref().map(str::trim) {
-        if mode.is_empty() {
-            anyhow::bail!(
-                "`--mode` needs one of: {}",
-                AMP_AGENT_MODES
-                    .iter()
-                    .map(|(m, _)| *m)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
-        if !AMP_AGENT_MODES.iter().any(|(m, _)| *m == mode) {
-            anyhow::bail!(
-                "unknown --mode '{mode}'. Valid: {}",
-                AMP_AGENT_MODES
-                    .iter()
-                    .map(|(m, _)| *m)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
     }
 
     let store = session_store();
