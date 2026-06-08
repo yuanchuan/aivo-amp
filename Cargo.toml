@@ -28,17 +28,13 @@ too_many_lines = "allow"
 
 [dependencies]
 # The aivo lib: reuse its key store, routers, http/provider utils, constants.
-#
-# Standalone build — what `aivo plugins install github:yuanchuan/aivo-amp` and
-# .github/workflows/release.yml compile — uses the *git* dep below, pinned to an
-# aivo release tag whose `serve_router` usage helpers (TokenUsage /
-# parse_token_usage / StreamUsageSniffer) are `pub`. That exposure ships after
-# v0.27.0, so pin the first tag that includes it (expected v0.28.0).
-#
-# Local co-dev: keep the path line; swap to the git line to test the standalone
-# build. Exactly one must be active.
-aivo = { path = "../aivo" }
-# aivo = { git = "https://github.com/yuanchuan/aivo", tag = "v0.28.0" }
+# Pinned to the public v0.27.0 tag so the plugin builds standalone — what
+# `aivo plugins install github:yuanchuan/aivo-amp`, CI, and release.yml compile.
+# The usage-accounting helpers the bridge needs are vendored in src/usage.rs, so
+# no unreleased aivo API is required. Local aivo co-dev: swap to the path line
+# (exactly one must be active).
+aivo = { git = "https://github.com/yuanchuan/aivo", tag = "v0.27.0" }
+# aivo = { path = "../aivo" }
 
 # CLI
 clap = { version = "4.5", features = ["derive"] }

@@ -2441,7 +2441,7 @@ async fn call_upstream_chat_streaming(
                     body.chars().take(400).collect::<String>()
                 );
             }
-            if let Some(usage) = aivo::services::serve_router::parse_token_usage(body.as_bytes()) {
+            if let Some(usage) = crate::usage::parse_token_usage(body.as_bytes()) {
                 record_amp_usage(&state.config, &model, &usage).await;
             }
             let parsed: serde_json::Value = serde_json::from_str(&body)
@@ -2478,9 +2478,8 @@ async fn call_upstream_chat_streaming(
                     body.chars().take(400).collect::<String>()
                 );
             }
-            let mut sniffer = aivo::services::serve_router::StreamUsageSniffer::new(
-                state.config.usage_store.is_some(),
-            );
+            let mut sniffer =
+                crate::usage::StreamUsageSniffer::new(state.config.usage_store.is_some());
             let blocks = stream_anthropic_sse(
                 upstream,
                 assistant_message_id,
@@ -2501,11 +2500,7 @@ async fn call_upstream_chat_streaming(
 
 /// Record one LLM turn's token usage against the configured stats key, labeled
 /// `amp`. Best-effort and fire-and-forget — never fails an amp turn.
-async fn record_amp_usage(
-    config: &AmpBridgeConfig,
-    model: &str,
-    usage: &aivo::services::serve_router::TokenUsage,
-) {
+async fn record_amp_usage(config: &AmpBridgeConfig, model: &str, usage: &crate::usage::TokenUsage) {
     if let Some(store) = &config.usage_store {
         let _ = store
             .record_tokens(
@@ -2532,7 +2527,7 @@ async fn stream_anthropic_sse(
     trace: Option<&Path>,
     full_path: &str,
     cancel_flag: &Arc<AtomicBool>,
-    sniffer: &mut aivo::services::serve_router::StreamUsageSniffer,
+    sniffer: &mut crate::usage::StreamUsageSniffer,
 ) -> Result<Vec<serde_json::Value>> {
     use futures::StreamExt;
     let mut byte_stream = upstream.bytes_stream();
