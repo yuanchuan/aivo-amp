@@ -751,6 +751,43 @@ fn normalize_thread_payload_to_neo(payload: &mut serde_json::Value) {
     }
 }
 
+/// Marks a served thread payload as actor-native so neo's switch/resume
+/// path connects directly instead of running the import-into-actor dance.
+///
+/// Neo decides whether a thread must be imported with
+/// `needsImport = thread.meta.usesThreadActors !== true` (`cVR` in the
+/// binary). When false, neo POSTs the thread to `/actors/.../import`,
+/// marks it imported, then resumes — a multi-step Rivet handshake the
+/// bridge only half-satisfies, leaving `connectingToThreadID` stuck and
+/// the composer frozen on "Loading thread" after a thread switch. Since
+/// the bridge already serves the actor WS and hydrates history from
+/// disk, we advertise every thread as actor-native (`meta.usesThreadActors
+/// = true`) so neo skips import and resumes straight away — the same path
+/// a freshly-created thread takes.
+fn mark_thread_actor_native(payload: &mut serde_json::Value) {
+    payload["usesThreadActors"] = json!(true);
+    payload["usesDtw"] = json!(false);
+    if !payload.get("meta").map(|m| m.is_object()).unwrap_or(false) {
+        payload["meta"] = json!({});
+    }
+    payload["meta"]["usesThreadActors"] = json!(true);
+
+    // Report a version that already accounts for every message we're
+    // serving. neo loads the full history from this `getThread`, then
+    // tells the actor "resume me from `v`" (`client_resume`). The
+    // bridge's resume arm replays `persisted_messages[v..]`, so a stale
+    // `v` (the old hardcoded `2`) makes it re-emit nearly the whole
+    // thread amp just loaded — a burst of duplicate `message_added`
+    // events on *every* thread switch. Pin `v` to the message count so
+    // the replay cursor lands at the end and nothing is re-sent.
+    let msg_count = payload
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    payload["v"] = json!(msg_count);
+}
+
 /// Extracts the first text from a user message's `content`, whether
 /// it's a plain string or an Anthropic-style content-block array.
 /// Returns an empty string when nothing usable is found.
@@ -1017,9 +1054,10 @@ impl WsState {
 
     /// Builds the on-disk thread payload from accumulated state.
     /// Format matches what amp's `getThread` expects in `result.thread.data`.
-    /// `usesDtw`/`usesThreadActors` mirror what the bridge advertises in
-    /// `handle_thread_actors` so amp's resume gate ("created with the Neo
-    /// TUI") doesn't refuse the thread.
+    /// `usesThreadActors:true` (+ `meta.usesThreadActors`) marks the thread
+    /// actor-native so neo resumes it directly instead of running the
+    /// import-into-actor handshake that freezes the composer; see
+    /// [`mark_thread_actor_native`].
     fn thread_payload(&self) -> serde_json::Value {
         let mut payload = json!({
             "id": self.thread_id,
@@ -1028,7 +1066,8 @@ impl WsState {
             "title": self.title.clone(),
             "created": self.created_at,
             "usesDtw": false,
-            "usesThreadActors": false,
+            "usesThreadActors": true,
+            "meta": {"usesThreadActors": true},
         });
         if let Some(mode) = &self.last_agent_mode {
             payload["agentMode"] = mode.clone();
@@ -3359,6 +3398,9 @@ async fn handle_internal_rpc(state: &AmpBridgeState, query: &str, body: &str) ->
                     // Serve neo-shaped tool_result blocks so amp's loader
                     // doesn't crash on legacy Anthropic-shaped threads.
                     normalize_thread_payload_to_neo(&mut payload);
+                    // Advertise actor-native so neo's resume skips the
+                    // import-into-actor handshake that freezes the composer.
+                    mark_thread_actor_native(&mut payload);
                     json!({
                         "ok": true,
                         "result": {"thread": {"data": payload}},
@@ -3402,6 +3444,7 @@ async fn handle_internal_rpc(state: &AmpBridgeState, query: &str, body: &str) ->
                     // with the tail so the merged preview thread is
                     // self-contained and we don't ship full history twice.
                     payload["messages"] = tail.clone();
+                    mark_thread_actor_native(&mut payload);
                     json!({
                         "ok": true,
                         "result": {"thread": {"data": payload}, "messages": tail},
@@ -5293,6 +5336,28 @@ mod tests {
     }
 
     #[test]
+    fn mark_thread_actor_native_skips_import_and_replay() {
+        // Legacy thread served by getThread: low `v`, no actor flags,
+        // an existing `meta` object that must be preserved.
+        let mut payload = json!({
+            "id": "T-legacy",
+            "v": 2,
+            "meta": {"traces": []},
+            "messages": [{"role": "user"}, {"role": "assistant"}, {"role": "user"}],
+        });
+        mark_thread_actor_native(&mut payload);
+        // needsImport = meta.usesThreadActors !== true → false, so neo
+        // resumes directly instead of running the import dance.
+        assert_eq!(payload["meta"]["usesThreadActors"].as_bool(), Some(true));
+        assert_eq!(payload["usesThreadActors"].as_bool(), Some(true));
+        // Existing meta keys survive.
+        assert!(payload["meta"]["traces"].is_array());
+        // `v` lands at the message count so client_resume's replay
+        // cursor is at the end — no duplicate message_added burst.
+        assert_eq!(payload["v"].as_u64(), Some(3));
+    }
+
+    #[test]
     fn thread_payload_carries_required_fields() {
         let ws_state = fake_ws_state();
         let payload = ws_state.thread_payload();
@@ -5301,7 +5366,10 @@ mod tests {
         assert_eq!(payload["v"].as_u64(), Some(2));
         assert!(payload["messages"].is_array());
         assert_eq!(payload["usesDtw"].as_bool(), Some(false));
-        assert_eq!(payload["usesThreadActors"].as_bool(), Some(false));
+        // Actor-native so neo resumes directly instead of importing —
+        // see `mark_thread_actor_native`.
+        assert_eq!(payload["usesThreadActors"].as_bool(), Some(true));
+        assert_eq!(payload["meta"]["usesThreadActors"].as_bool(), Some(true));
         // `created` is set at WsState construction and must be a parseable
         // ISO-8601 timestamp — amp passes it to `new Date(...)`.
         let created = payload["created"].as_str().expect("created is string");
