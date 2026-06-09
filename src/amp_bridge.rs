@@ -1184,6 +1184,20 @@ async fn ws_followup_events(
                 }
             }
         }
+        // Mirror of `executor_tools_register`: amp drops tools when an
+        // MCP server disconnects or a plugin tool goes away. Without
+        // pruning, the next `agent_turn` keeps advertising the dead
+        // tool to the LLM, which then calls a tool the executor can no
+        // longer run. Schema: `{toolNames: string[]}`.
+        "executor_tools_unregister" => {
+            if let Some(names) = params.get("toolNames").and_then(|v| v.as_array()) {
+                let drop: std::collections::HashSet<&str> =
+                    names.iter().filter_map(|n| n.as_str()).collect();
+                ws_state
+                    .tools
+                    .retain(|t| !drop.contains(t.get("name").and_then(|v| v.as_str()).unwrap_or("")));
+            }
+        }
         // amp's outbox retries this every ~500ms until it sees a
         // `message_added` server event with the matching `messageId`
         // (`TZR` in the binary). Retries that arrive while we're
@@ -1300,6 +1314,31 @@ async fn ws_followup_events(
         "client_mark_message_read"
         | "client_mark_message_unread"
         | "client_dismiss_active_error" => {}
+        // Known `request()` frames the bridge has no server-side state
+        // to mutate. `ws_stub_reply` has already answered each with an
+        // empty `result`, which is all amp's `.then()` awaits — so the
+        // ONLY thing left to do is *not* fall through to the
+        // unrecognized-protocol arm below, which would raise a bogus
+        // "update aivo" error bar and park `agent_state` on `error` for
+        // routine user actions:
+        //   - remove/steer a queued message: aivo runs no server-side
+        //     message queue (queued msgs arrive later as
+        //     `client_append_user_msg`), so there's nothing to drop.
+        //   - upsert_notification_subscription: aivo models no
+        //     server-side notification state.
+        //   - spawn_executor: only the local executor connects (via
+        //     `executor_connect`); amp never requests a sandbox spawn
+        //     against the bridge, but ack it defensively.
+        "client_remove_queued_msg"
+        | "client_steer_queued_msg"
+        | "client_upsert_notification_subscription"
+        | "client_spawn_executor" => {}
+        // Manual `$ <cmd>` invocation. `ws_stub_reply`'s empty result
+        // satisfies the request, so this no longer errors — but the
+        // bridge does not yet run the command or append its output, so
+        // the feature is a graceful no-op rather than fully wired.
+        // Schema: `{args, run, hidden}`.
+        "client_append_manual_bash_invocation" => {}
         // amp's executor uploads project context as snapshots on
         // connect (and refreshes them via *_update events). Without
         // these the LLM has no idea what workspace it's in — pwd,
@@ -1435,7 +1474,8 @@ async fn ws_followup_events(
         // and the git-context status bar both depend on this routing.
         "client_filesystem_read_file"
         | "client_filesystem_read_directory"
-        | "client_git_command" => {
+        | "client_git_command"
+        | "client_git_diff_snapshot" => {
             let forwarded = method.replacen("client_", "executor_", 1);
             send_event(
                 write_tx,
@@ -1452,7 +1492,8 @@ async fn ws_followup_events(
         }
         "executor_filesystem_read_file_result"
         | "executor_filesystem_read_directory_result"
-        | "executor_git_command_result" => {
+        | "executor_git_command_result"
+        | "executor_git_diff_snapshot_result" => {
             let forwarded = method.replacen("executor_", "client_", 1);
             send_event(
                 write_tx,
@@ -5637,6 +5678,11 @@ mod tests {
                 "executor_git_command",
                 json!({"requestId": "req-3", "args": ["status"]}),
             ),
+            (
+                "client_git_diff_snapshot",
+                "executor_git_diff_snapshot",
+                json!({"requestId": "req-4", "baseRevision": "HEAD"}),
+            ),
         ];
         for (inbound, expected_outbound, params) in cases {
             let mut ws_state = fake_ws_state();
@@ -5683,6 +5729,11 @@ mod tests {
                 "executor_git_command_result",
                 "client_git_command_result",
                 json!({"requestId": "req-3", "ok": true, "exitCode": 0, "stdout": "", "stderr": ""}),
+            ),
+            (
+                "executor_git_diff_snapshot_result",
+                "client_git_diff_snapshot_result",
+                json!({"requestId": "req-4", "ok": true, "files": []}),
             ),
         ];
         for (inbound, expected_outbound, params) in cases {
@@ -6299,6 +6350,69 @@ mod tests {
         }
         assert!(!had_error, "non-client notification must not warn");
         assert!(!ws_state.protocol_warned);
+    }
+
+    /// Routine user actions (remove/steer a queued message, manual `$`
+    /// bash, notification subscribe, executor spawn) send `client_*`
+    /// `request()` frames the bridge has no state for. They must be
+    /// silently accepted — NOT routed to the unrecognized-protocol arm,
+    /// which would raise a bogus "update aivo" error bar and park the
+    /// agent on `error` mid-session.
+    #[tokio::test]
+    async fn benign_client_requests_do_not_warn_or_error() {
+        let state = fake_bridge_state();
+        let mut ws_state = fake_ws_state();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        for method in [
+            "client_remove_queued_msg",
+            "client_steer_queued_msg",
+            "client_upsert_notification_subscription",
+            "client_spawn_executor",
+            "client_append_manual_bash_invocation",
+        ] {
+            let frame = json!({"id": "r1", "method": method, "params": {}}).to_string();
+            ws_followup_events(&state, &mut ws_state, &frame, &tx, None, "/test").await;
+        }
+        drop(tx);
+
+        let mut emitted = false;
+        while let Some(_s) = rx.recv().await {
+            emitted = true;
+        }
+        assert!(!emitted, "benign requests emit no follow-up events");
+        assert!(
+            !ws_state.protocol_warned,
+            "benign requests must not trip the protocol warning"
+        );
+    }
+
+    /// executor_tools_unregister prunes the named tools so the next
+    /// agent_turn stops advertising a tool the executor can no longer
+    /// run (e.g. after an MCP server disconnects).
+    #[tokio::test]
+    async fn executor_tools_unregister_prunes_named_tools() {
+        let state = fake_bridge_state();
+        let mut ws_state = fake_ws_state();
+        ws_state.tools = vec![
+            json!({"name": "Bash", "description": "", "input_schema": {}}),
+            json!({"name": "mcp__x__do", "description": "", "input_schema": {}}),
+            json!({"name": "Read", "description": "", "input_schema": {}}),
+        ];
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let frame = json!({
+            "method": "executor_tools_unregister",
+            "params": {"toolNames": ["mcp__x__do"]},
+        })
+        .to_string();
+        ws_followup_events(&state, &mut ws_state, &frame, &tx, None, "/test").await;
+
+        let names: Vec<&str> = ws_state
+            .tools
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert_eq!(names, vec!["Bash", "Read"], "only the named tool is dropped");
     }
 
     /// neo fires read-state / error-dismiss notifications
