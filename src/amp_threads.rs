@@ -13,9 +13,13 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
+use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use tokio::fs;
 
+use aivo::services::share_payload::{
+    ContentBlock, ProjectInfo, SHARE_SCHEMA_VERSION, ShareMessage, SharePayload,
+};
 use aivo::services::system_env;
 
 /// `~/.config/aivo/amp-threads/`. Falls back to a relative path if the
@@ -74,6 +78,246 @@ pub async fn save_thread(dir: &Path, payload: &Value) -> Result<String> {
         .await
         .with_context(|| format!("writing thread {}", path.display()))?;
     Ok(id)
+}
+
+// ---------------------------------------------------------------------------
+// Transcript export (for `aivo share`)
+// ---------------------------------------------------------------------------
+//
+// amp's thread format isn't one aivo reads, so amp opts into `aivo share` via the
+// protocol's native export (docs/PLUGIN-PROTOCOL.md → Native export): the host
+// runs `--aivo-export-transcript --cwd --ts` and we print one `SharePayload` for
+// the thread that ran at `--ts`. Matching by time (not cwd) sidesteps amp's
+// launch-cwd vs workspace-tree mismatch.
+
+/// Build the share transcript for the thread whose last activity is nearest
+/// `ts`, as aivo's `SharePayload`. `None` when no threads are on disk. `cwd`
+/// (the run's launch dir) only labels the project — matching is by time.
+pub async fn export_transcript(
+    threads_dir: &Path,
+    cwd: &str,
+    ts: DateTime<Utc>,
+) -> Option<SharePayload> {
+    let threads = load_threads_with_time(threads_dir).await;
+    let thread = closest_thread(&threads, ts)?;
+    Some(thread_to_share_payload(thread, cwd))
+}
+
+/// Map an amp thread payload into aivo's `SharePayload`. `source_cli` is `amp`
+/// so the share is labeled as amp, not a borrowed storage format. `model` is
+/// left `None` — the host overrides it from the run's logged value.
+fn thread_to_share_payload(thread: &Value, cwd: &str) -> SharePayload {
+    let id = thread
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let created = thread_created_utc(thread.get("created"));
+    let messages = thread
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|msg| amp_message_to_share(msg, created))
+        .collect();
+    SharePayload {
+        schema_version: SHARE_SCHEMA_VERSION.to_string(),
+        source_cli: "amp".to_string(),
+        session_id: id,
+        project: ProjectInfo {
+            root: (!cwd.is_empty()).then(|| cwd.to_string()),
+            name: project_name(cwd),
+        },
+        model: None,
+        created_at: created,
+        // Same last-activity value used to select this thread — one source of truth.
+        updated_at: thread_updated_utc(thread),
+        messages,
+        meta: SharePayload::new_meta(false),
+    }
+}
+
+/// One amp message → one `ShareMessage`: `text`→text block, `thinking`→the
+/// message's `reasoning`, `tool_use`→tool_call, `tool_result`→tool_result.
+/// `None` when the message has no renderable content and no reasoning.
+fn amp_message_to_share(msg: &Value, fallback: Option<DateTime<Utc>>) -> Option<ShareMessage> {
+    let role = msg
+        .get("role")
+        .and_then(|r| r.as_str())
+        .unwrap_or("user")
+        .to_string();
+    let blocks = msg.get("content").and_then(|c| c.as_array())?;
+    let mut content = Vec::new();
+    let mut reasoning = String::new();
+    for b in blocks {
+        match b.get("type").and_then(|t| t.as_str()) {
+            Some("text") => {
+                if let Some(t) = b
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    content.push(ContentBlock::Text {
+                        text: t.to_string(),
+                    });
+                }
+            }
+            Some("thinking") => {
+                if let Some(t) = b
+                    .get("thinking")
+                    .and_then(|t| t.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    if !reasoning.is_empty() {
+                        reasoning.push('\n');
+                    }
+                    reasoning.push_str(t);
+                }
+            }
+            Some("tool_use") => content.push(ContentBlock::ToolCall {
+                id: b.get("id").and_then(|v| v.as_str()).map(str::to_string),
+                name: b
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("tool")
+                    .to_string(),
+                arguments: b.get("input").cloned().unwrap_or(Value::Null),
+            }),
+            Some("tool_result") => {
+                let (ok, output) = amp_tool_result(b.get("run"));
+                content.push(ContentBlock::ToolResult {
+                    id: b
+                        .get("toolUseID")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    ok,
+                    output,
+                    error: None,
+                });
+            }
+            _ => {}
+        }
+    }
+    if content.is_empty() && reasoning.is_empty() {
+        return None;
+    }
+    Some(ShareMessage {
+        role,
+        timestamp: message_ts(msg, fallback),
+        model: None,
+        reasoning: (!reasoning.is_empty()).then_some(reasoning),
+        content,
+    })
+}
+
+/// Extract `(ok, output)` from an amp `tool_result.run`. amp nests the result
+/// text at `run.result.content[].text` and a `run.status` ("success"/"error");
+/// fall back to compact JSON of `result` when there's no plain text.
+fn amp_tool_result(run: Option<&Value>) -> (bool, String) {
+    let Some(run) = run else {
+        return (true, String::new());
+    };
+    let ok = !run
+        .get("status")
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .eq_ignore_ascii_case("error");
+    let output = run
+        .get("result")
+        .and_then(|r| r.get("content"))
+        .and_then(|c| c.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .filter(|s| !s.is_empty())
+        .or_else(|| run.get("result").map(|r| r.to_string()))
+        .unwrap_or_default();
+    (ok, output)
+}
+
+/// Per-message timestamp: amp stamps a user turn with `meta.sentAt` and an
+/// assistant turn's blocks with `startTime`/`finalTime` (unix-ms); fall back to
+/// the thread's `created`.
+fn message_ts(msg: &Value, fallback: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
+    msg.get("meta")
+        .and_then(|m| m.get("sentAt"))
+        .and_then(|v| v.as_i64())
+        .or_else(|| block_time_ms(msg))
+        .and_then(DateTime::from_timestamp_millis)
+        .or(fallback)
+}
+
+/// Last path component of `cwd`, for the share's project name.
+fn project_name(cwd: &str) -> Option<String> {
+    Path::new(cwd)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(str::to_string)
+}
+
+/// Read every thread paired with its **last-activity** time (newest message ts).
+/// Matching on activity, not `created`, mirrors aivo's `updated_at` matching and
+/// resolves a *resumed* thread (`amp threads continue T-old` runs now, so its last
+/// turn is recent though `created` is old). Untimestamped threads are skipped.
+async fn load_threads_with_time(dir: &Path) -> Vec<(DateTime<Utc>, Value)> {
+    let mut out = Vec::new();
+    let Ok(mut rd) = fs::read_dir(dir).await else {
+        return out;
+    };
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(bytes) = fs::read(&path).await else {
+            continue;
+        };
+        let Ok(payload) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        if let Some(updated) = thread_updated_utc(&payload) {
+            out.push((updated, payload));
+        }
+    }
+    out
+}
+
+/// A thread's last-activity time: the newest per-message timestamp, falling back
+/// to `created` when no message carries one.
+fn thread_updated_utc(thread: &Value) -> Option<DateTime<Utc>> {
+    let created = thread_created_utc(thread.get("created"));
+    thread
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|msg| message_ts(msg, None))
+        .max()
+        .or(created)
+}
+
+/// The thread whose last-activity time is nearest `ts`.
+fn closest_thread(threads: &[(DateTime<Utc>, Value)], ts: DateTime<Utc>) -> Option<&Value> {
+    threads
+        .iter()
+        .min_by_key(|(updated, _)| (ts - *updated).num_seconds().abs())
+        .map(|(_, payload)| payload)
+}
+
+/// Largest `finalTime`/`startTime` across a message's content blocks (unix-ms).
+fn block_time_ms(msg: &Value) -> Option<i64> {
+    let blocks = msg.get("content")?.as_array()?;
+    blocks
+        .iter()
+        .filter_map(|b| {
+            b.get("finalTime")
+                .or_else(|| b.get("startTime"))
+                .and_then(|v| v.as_i64())
+        })
+        .max()
 }
 
 /// Loads a previously-saved thread by ID, or `None` if missing/corrupt.
@@ -879,5 +1123,116 @@ mod tests {
     async fn load_thread_tail_missing_thread_is_none() {
         let dir = tempfile::tempdir().unwrap();
         assert!(load_thread_tail(dir.path(), "T-nope", 10).await.is_none());
+    }
+
+    /// Export picks the thread nearest `--ts`, labels it `amp`, and renders the
+    /// full shape: text, thinking→reasoning, tool_use→tool_call,
+    /// tool_result→tool_result. A second, far-in-time thread is ignored.
+    #[tokio::test]
+    async fn export_transcript_builds_rich_amp_payload_for_nearest_thread() {
+        use aivo::services::share_payload::ContentBlock;
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("amp-threads");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let created_ms = 1_778_213_296_920i64;
+        let target = json!({
+            "v": 2, "id": "T-019e05ae-80a5-7718-80ee-ec89cb6fc1c0", "created": created_ms,
+            "messages": [
+                {"role": "user", "meta": {"sentAt": created_ms},
+                 "content": [{"type": "text", "text": "run ls"}]},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "I'll list files", "startTime": created_ms + 1000},
+                    {"type": "tool_use", "name": "bash", "id": "call_1", "input": {"cmd": "ls"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "toolUseID": "call_1",
+                     "run": {"status": "success", "result": {"content": [{"text": "a.txt\nb.txt"}]}}},
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "Two files.", "finalTime": created_ms + 3000},
+                ]},
+            ],
+        });
+        save_thread(&dir, &target).await.unwrap();
+        // A decoy thread far from the run time — must not be selected.
+        let decoy = json!({
+            "v": 2, "id": "T-decoy-aaaa-bbbb-cccc-dddddddddddd", "created": created_ms - 9_000_000i64,
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "old"}]}],
+        });
+        save_thread(&dir, &decoy).await.unwrap();
+
+        let ts = DateTime::from_timestamp_millis(created_ms + 2000).unwrap();
+        let share = export_transcript(&dir, "/private/tmp", ts).await.unwrap();
+
+        assert_eq!(share.source_cli, "amp");
+        assert_eq!(share.session_id, "T-019e05ae-80a5-7718-80ee-ec89cb6fc1c0");
+        assert_eq!(share.project.root.as_deref(), Some("/private/tmp"));
+        assert_eq!(share.project.name.as_deref(), Some("tmp"));
+        // user prompt, assistant(tool_use w/ reasoning), user(tool_result), assistant(text)
+        assert_eq!(share.messages.len(), 4);
+        // Reasoning is lifted onto the assistant message, not a content block.
+        assert_eq!(
+            share.messages[1].reasoning.as_deref(),
+            Some("I'll list files")
+        );
+        assert!(matches!(
+            share.messages[1].content[0],
+            ContentBlock::ToolCall { ref name, .. } if name == "bash"
+        ));
+        assert!(matches!(
+            share.messages[2].content[0],
+            ContentBlock::ToolResult { ok: true, ref output, .. } if output == "a.txt\nb.txt"
+        ));
+    }
+
+    #[tokio::test]
+    async fn export_transcript_none_when_no_threads() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("empty");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ts = DateTime::from_timestamp_millis(1_778_213_296_920i64).unwrap();
+        assert!(export_transcript(&dir, "/tmp", ts).await.is_none());
+    }
+
+    /// A *resumed* thread (old `created`, but its newest turn lands at the run
+    /// time) must win over a thread created nearer the run but whose activity is
+    /// later — i.e. match on last-activity, not creation. This would pick the
+    /// wrong thread under `created`-based matching.
+    #[tokio::test]
+    async fn export_transcript_matches_last_activity_not_created() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("amp-threads");
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = 1_778_213_296_920i64;
+
+        // Resumed: created a day ago, but its last turn is right at the run.
+        save_thread(
+            &dir,
+            &json!({
+                "v": 2, "id": "T-resumed-aaaa-bbbb-cccc-dddddddddddd",
+                "created": base - 100_000_000i64,
+                "messages": [{"role": "user", "meta": {"sentAt": base + 500},
+                              "content": [{"type": "text", "text": "continue"}]}],
+            }),
+        )
+        .await
+        .unwrap();
+        // Decoy: created just after the run starts, but its activity is 60s later.
+        save_thread(
+            &dir,
+            &json!({
+                "v": 2, "id": "T-decoy0-aaaa-bbbb-cccc-dddddddddddd",
+                "created": base + 1000,
+                "messages": [{"role": "user", "meta": {"sentAt": base + 60_000},
+                              "content": [{"type": "text", "text": "other"}]}],
+            }),
+        )
+        .await
+        .unwrap();
+
+        let ts = DateTime::from_timestamp_millis(base).unwrap();
+        let share = export_transcript(&dir, "/tmp", ts).await.unwrap();
+        assert_eq!(share.session_id, "T-resumed-aaaa-bbbb-cccc-dddddddddddd");
     }
 }

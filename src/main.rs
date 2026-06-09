@@ -52,6 +52,12 @@ async fn run() -> i32 {
         return 0;
     }
 
+    // Native transcript export for `aivo share` (no key/launch/network, like
+    // `--aivo-manifest`). See docs/PLUGIN-PROTOCOL.md → Native export.
+    if argv.get(1).map(String::as_str) == Some("--aivo-export-transcript") {
+        return export_transcript_cmd(&argv).await;
+    }
+
     // Management subcommand: `aivo amp trust …`.
     if argv.get(1).map(String::as_str) == Some("trust") {
         let args = cli::AmpArgs::parse();
@@ -80,7 +86,9 @@ async fn run() -> i32 {
 /// consumes the `raw-key`/`endpoint` env handoff (which is why neither is
 /// declared). `config-read`/`config-write` read and persist to aivo's key store
 /// (active/starter key, learned routes) and shared `logs.db`; `spawn` launches
-/// the real `amp` binary.
+/// the real `amp` binary. `transcripts: {format:"native"}` opts amp into
+/// `aivo share` via native export (`--aivo-export-transcript` → our own
+/// `SharePayload`, `source: amp`).
 fn print_manifest() {
     // Build the manifest as raw JSON rather than aivo's `PluginManifest` type:
     // that type is `pub(crate)` by design, since the protocol boundary is
@@ -97,10 +105,46 @@ fn print_manifest() {
         // descriptions), so tell aivo to skip its duplicate help banner.
         "documents_aivo_flags": true,
         "capabilities": ["config-read", "config-write", "spawn"],
+        // amp emits its own transcript (--aivo-export-transcript) → source: amp.
+        "transcripts": { "format": "native" },
         "requires": [{ "bin": "amp", "install": "npm install -g @ampcode/cli" }],
         "homepage": env!("CARGO_PKG_REPOSITORY"),
     });
     println!("{manifest}");
+}
+
+/// Print the `SharePayload` JSON for the thread matching this run (by `--ts`;
+/// `--cwd` only labels the project). Exits `1` with a stderr note when no thread
+/// matches or serialization fails.
+async fn export_transcript_cmd(argv: &[String]) -> i32 {
+    let cwd = flag_value(argv, "--cwd").unwrap_or_default();
+    let ts = flag_value(argv, "--ts")
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+        .map(|d| d.with_timezone(&chrono::Utc))
+        .unwrap_or_else(chrono::Utc::now);
+    let dir = amp_threads::default_threads_dir();
+    let Some(payload) = amp_threads::export_transcript(&dir, &cwd, ts).await else {
+        eprintln!("no amp thread found for the requested run");
+        return ExitCode::UserError.code();
+    };
+    match serde_json::to_string(&payload) {
+        Ok(json) => {
+            println!("{json}");
+            ExitCode::Success.code()
+        }
+        Err(e) => {
+            eprintln!("transcript serialization failed: {e}");
+            ExitCode::UserError.code()
+        }
+    }
+}
+
+/// First value after `flag` in argv (`--flag value`), if present.
+fn flag_value(argv: &[String], flag: &str) -> Option<String> {
+    argv.iter()
+        .position(|a| a == flag)
+        .and_then(|i| argv.get(i + 1))
+        .cloned()
 }
 
 /// Emit amp's usage as one `aivo.stats/v1` JSON object: one **timestamped
