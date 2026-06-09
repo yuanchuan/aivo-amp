@@ -89,6 +89,19 @@ pub async fn run_amp(
         args.push("--settings-file".to_string());
         args.push(sf.to_string());
     }
+    // Pin the initial agent mode through amp's own `--mode` flag (it controls
+    // the model, system prompt, and tool selection); the bridge then picks the
+    // same mode up from the first turn's `agentMode`. `--mode` is consumed by
+    // our own CLI, so the resolved value is re-added here.
+    if let Some(mode) = modes
+        .initial_mode
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    {
+        args.push("--mode".to_string());
+        args.push(mode.to_string());
+    }
     args.extend(amp_args.iter().cloned());
 
     // Run accounting — the `[run]` started/finished pair in `aivo logs` /
@@ -176,14 +189,6 @@ pub fn for_amp(
             disable_tools.join(","),
         );
 
-        if let Some(m) = amp_modes
-            .initial_mode
-            .as_deref()
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
-        {
-            env.insert("AIVO_AMP_INITIAL_MODE".to_string(), m.to_string());
-        }
         if let Some(modes_obj) = internal_mode_model {
             env.insert(
                 "AIVO_AMP_INTERNAL_MODEL_JSON".to_string(),
@@ -246,14 +251,6 @@ pub fn for_amp(
             disable_tools.join(","),
         );
 
-        if let Some(m) = amp_modes
-            .initial_mode
-            .as_deref()
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
-        {
-            env.insert("AIVO_AMP_INITIAL_MODE".to_string(), m.to_string());
-        }
         if let Some(modes_obj) = internal_mode_model {
             env.insert(
                 "AIVO_AMP_INTERNAL_MODEL_JSON".to_string(),
