@@ -1116,13 +1116,32 @@ async fn ws_followup_events(
                 ws_state.pending_assistant_ids.push(assistant_id);
             }
         }
-        // The reader task already flipped the cancel flag the moment
-        // this frame arrived (so the in-flight stream can poll and
-        // bail), and agent_turn_finish will emit the `cancelled` /
-        // `message_updated` / `agent_state idle` chain once the bailed
-        // stream returns. Nothing left to do here — but match the arm
-        // explicitly so the `_ => {}` fallthrough doesn't pick it up.
-        "client_cancel" => {}
+        // The reader task flips the cancel flag the moment this frame
+        // arrives so an in-flight stream can poll it and bail. When a turn
+        // IS live, that bailed stream runs finish_turn_as_cancelled — which
+        // clears the flag and emits the `cancelled` / `message_updated` /
+        // `agent_state idle` chain — BEFORE the (single-threaded) worker
+        // ever dequeues this frame. So reaching this arm with the flag
+        // already cleared means the cancel was handled: nothing to do.
+        //
+        // But if we get here with the flag STILL set, no live turn absorbed
+        // it: the status bar is parked on `error` (a settled upstream
+        // failure) or `running_tools` (a stuck tool, e.g. the Librarian in
+        // aivo#14) with no in-flight stream left to move it. Esc would be a
+        // no-op and the badge/spinner would never clear. Abandon any
+        // orphaned tool leases and drop the agent back to idle so the user
+        // gets their prompt back.
+        "client_cancel" => {
+            // Flag still set => no live turn absorbed the cancel (an
+            // in-flight stream would have cleared it via
+            // finish_turn_as_cancelled before we dequeued this frame).
+            let unhandled = ws_state.cancel_flag.swap(false, Ordering::SeqCst);
+            if unhandled {
+                ws_state.pending_tool_uses.clear();
+                ws_state.tool_results.clear();
+                emit_agent_state(write_tx, trace, full_path, "idle", None).await;
+            }
+        }
         // Read-state + error-bar notifications neo fires on its own:
         // `client_mark_message_read` auto-emits whenever a message
         // scrolls into view with the terminal focused, `*_unread` is its
@@ -3100,6 +3119,32 @@ async fn dispatch(
         ));
     }
 
+    // amp's Librarian tool and the `amp threads <query>` CLI both search
+    // the user's threads via `GET /api/threads/find?q=<query>&limit=N&
+    // offset=M`, parsing `{threads:[...], hasMore:bool}`. On the real
+    // ampcode.com backend this is server-side full-text search; the
+    // bridge has to answer it from locally-persisted threads or the
+    // Librarian hangs with no result and (pre-fix) couldn't be cancelled
+    // — the stuck-Librarian half of aivo#14.
+    if path == "/api/threads/find" {
+        const DEFAULT_LIMIT: usize = 20;
+        let mut q = String::new();
+        let mut limit = DEFAULT_LIMIT;
+        let mut offset = 0usize;
+        for (k, v) in url::form_urlencoded::parse(query.as_bytes()) {
+            match k.as_ref() {
+                "q" => q = v.into_owned(),
+                "limit" => limit = v.parse().unwrap_or(DEFAULT_LIMIT),
+                "offset" => offset = v.parse().unwrap_or(0),
+                _ => {}
+            }
+        }
+        let (threads, has_more) =
+            amp_threads::find_threads(&state.config.threads_dir, &q, limit, offset).await;
+        let body = json!({"threads": threads, "hasMore": has_more}).to_string();
+        return Ok(stub_buffered(body, CONTENT_TYPE_JSON));
+    }
+
     eprintln!("[amp-bridge] UNHANDLED: {method} {full_path}");
     if state.config.trace_log_path.is_none() {
         eprintln!("[amp-bridge] re-run with --debug to capture the request body");
@@ -4332,6 +4377,57 @@ mod tests {
         assert_eq!(tail[2]["messageId"], "M-4");
         // data.messages stays consistent with the tail (no double history).
         assert_eq!(v["result"]["thread"]["data"]["messages"], json!(tail));
+    }
+
+    /// aivo#14 stuck-Librarian: `GET /api/threads/find?q=...` used to
+    /// fall through to the 404 UNHANDLED branch, leaving the Librarian
+    /// tool hung. dispatch now serves the `{threads, hasMore}` envelope
+    /// amp parses, with `+`/`%XX`-encoded query params decoded.
+    #[tokio::test]
+    async fn dispatch_serves_threads_find_envelope() {
+        let dir = tempfile::tempdir().unwrap();
+        amp_threads::save_thread(
+            dir.path(),
+            &json!({"id": "T-019e05ae-80a5-7718-80ee-ec89cb6fc1c0", "v": 2,
+                    "title": "Librarian design", "created": "2026-05-29T00:00:00Z",
+                    "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]}),
+        )
+        .await
+        .unwrap();
+        let state = bridge_state_with_threads_dir(dir.path().to_path_buf());
+
+        // `+` is a space, so q = "librarian OR libraian".
+        let full_path = "/api/threads/find?q=librarian+OR+libraian&limit=10";
+        let req = format!("GET {full_path} HTTP/1.1\r\n\r\n");
+        let resp = dispatch(&state, &req, "GET", full_path, "").await.unwrap();
+        let BridgeResponse::Buffered { status, body, .. } = resp else {
+            panic!("expected buffered response");
+        };
+        assert_eq!(status, 200, "must not 404 into the UNHANDLED branch");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        // Exact shape amp's Librarian destructures: `{threads, hasMore}`.
+        let threads = v["threads"].as_array().expect("threads array");
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0]["id"], "T-019e05ae-80a5-7718-80ee-ec89cb6fc1c0");
+        assert_eq!(v["hasMore"], false);
+    }
+
+    /// A find query matching nothing must still return a well-formed
+    /// empty envelope (status 200) — never the 404 the Librarian hangs on.
+    #[tokio::test]
+    async fn dispatch_threads_find_empty_result_is_well_formed() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = bridge_state_with_threads_dir(dir.path().to_path_buf());
+        let full_path = "/api/threads/find?q=nomatch&limit=10";
+        let req = format!("GET {full_path} HTTP/1.1\r\n\r\n");
+        let resp = dispatch(&state, &req, "GET", full_path, "").await.unwrap();
+        let BridgeResponse::Buffered { status, body, .. } = resp else {
+            panic!("expected buffered response");
+        };
+        assert_eq!(status, 200);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["threads"], json!([]));
+        assert_eq!(v["hasMore"], false);
     }
 
     #[tokio::test]
@@ -5744,6 +5840,69 @@ mod tests {
             Some("error"),
             "final agent_state should be \"error\", got {last_agent_state}"
         );
+    }
+
+    /// aivo#14: once a turn settles on `error` (or parks on
+    /// `running_tools` waiting on a stuck tool), there's no in-flight
+    /// stream to absorb a `client_cancel`. The reader still flips the
+    /// cancel flag, so the worker reaches the arm with the flag SET — and
+    /// must drop the agent back to `idle` (clearing orphaned tool leases)
+    /// so Esc isn't a no-op and the badge/spinner clears.
+    #[tokio::test]
+    async fn client_cancel_with_no_live_turn_resets_stuck_status_to_idle() {
+        let state = fake_bridge_state();
+        let mut ws_state = fake_ws_state();
+        // Simulate the stuck-Librarian state: a pending tool lease that
+        // never returned, status parked on running_tools, and the reader
+        // having flipped the flag the instant client_cancel landed.
+        ws_state.pending_tool_uses.insert(new_tool_call_id());
+        ws_state.cancel_flag.store(true, Ordering::SeqCst);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        let frame = json!({"jsonrpc": "2.0", "method": "client_cancel", "params": {}}).to_string();
+        ws_followup_events(&state, &mut ws_state, &frame, &tx, None, "/test").await;
+        drop(tx);
+
+        let frames: Vec<serde_json::Value> = {
+            let mut v = Vec::new();
+            while let Some(s) = rx.recv().await {
+                v.push(serde_json::from_str(&s).unwrap());
+            }
+            v
+        };
+        // Exactly one agent_state frame, and it returns to idle.
+        let agent_states: Vec<&str> = frames
+            .iter()
+            .filter(|v| v["method"].as_str() == Some("agent_state"))
+            .map(|v| v["params"]["state"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(agent_states, vec!["idle"], "got {frames:?}");
+        // Orphaned lease abandoned and flag reset so the next turn is clean.
+        assert!(ws_state.pending_tool_uses.is_empty());
+        assert!(!ws_state.cancel_flag.load(Ordering::SeqCst));
+    }
+
+    /// The mirror case: a `client_cancel` that an in-flight turn already
+    /// absorbed (finish_turn_as_cancelled cleared the flag before the
+    /// worker dequeued the frame) must NOT re-emit idle — doing so would
+    /// race a freshly-started follow-up turn's `working` state back off.
+    #[tokio::test]
+    async fn client_cancel_already_handled_is_a_noop() {
+        let state = fake_bridge_state();
+        let mut ws_state = fake_ws_state();
+        // Flag already cleared => the live-turn path handled the cancel.
+        ws_state.cancel_flag.store(false, Ordering::SeqCst);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        let frame = json!({"jsonrpc": "2.0", "method": "client_cancel", "params": {}}).to_string();
+        ws_followup_events(&state, &mut ws_state, &frame, &tx, None, "/test").await;
+        drop(tx);
+
+        let mut emitted_any = false;
+        while let Some(_s) = rx.recv().await {
+            emitted_any = true;
+        }
+        assert!(!emitted_any, "no frames when the cancel was already handled");
     }
 
     /// An unrecognized `client_*` frame (amp's client protocol moved

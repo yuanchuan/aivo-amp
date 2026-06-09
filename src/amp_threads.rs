@@ -143,52 +143,214 @@ pub async fn list_threads(dir: &Path, limit: usize) -> Vec<Value> {
         let Ok(payload) = serde_json::from_slice::<Value>(&bytes) else {
             continue;
         };
-        // Skip pre-neo amp uploads (v=23, numeric created, integer
-        // messageIds). They were persisted back when the bridge
-        // intercepted amp's `uploadThread` HTTP RPC; neo amp uses
-        // WebSocket sync and never calls uploadThread, but the old
-        // files still sit on disk. Different schema (integer
-        // messageIds, different message envelope) so amp's neo TUI
-        // can't render them in `amp threads list` either — they'd
-        // just clutter `aivo logs` with "(amp thread, N messages)"
-        // rows lacking titles.
-        if !is_neo_thread(&payload) {
-            continue;
+        if let Some(summary) = thread_summary(&payload, mtime) {
+            out.push(summary);
         }
-        let id = payload.get("id").and_then(|s| s.as_str()).unwrap_or("");
-        if id.is_empty() {
-            continue;
-        }
-        let title = payload.get("title").cloned().unwrap_or(Value::Null);
-        let created = payload.get("created").cloned().unwrap_or(Value::Null);
-        let agent_mode = payload
-            .get("agentMode")
-            .cloned()
-            .unwrap_or_else(|| Value::String("smart".to_string()));
-        let message_count = payload
-            .get("messages")
-            .and_then(|m| m.as_array())
-            .map(|a| a.len())
-            .unwrap_or(0);
-        let updated_at = chrono::DateTime::<chrono::Utc>::from(mtime).to_rfc3339();
-        // amp's CLI thread list reads `userLastInteractedAt` and feeds it
-        // to `new Date(...).toISOString()`. Without this field amp crashes
-        // with `RangeError: Invalid Date`. We mirror `updatedAt` since
-        // we can't tell the two apart without amp's own activity tracking.
-        out.push(json!({
-            "id": id,
-            "title": title,
-            "agentMode": agent_mode,
-            "created": created,
-            "updatedAt": updated_at,
-            "userLastInteractedAt": updated_at,
-            "messageCount": message_count,
-            "creatorUserID": "user_aivo_local",
-            // Neo's switch picker hard-derefs `relationships.find` per row; omit it and the picker build crashes.
-            "relationships": [],
-        }));
     }
     out
+}
+
+/// Builds one listThreads / `threads/find` summary row from a thread
+/// payload + its file mtime, or `None` when the payload isn't a
+/// renderable neo thread.
+///
+/// Skips pre-neo amp uploads (v=23, numeric created, integer
+/// messageIds). They were persisted back when the bridge intercepted
+/// amp's `uploadThread` HTTP RPC; neo amp uses WebSocket sync and never
+/// calls uploadThread, but the old files still sit on disk. Different
+/// schema (integer messageIds, different message envelope) so amp's neo
+/// TUI can't render them in `amp threads list` either — they'd just
+/// clutter `aivo logs` with "(amp thread, N messages)" rows lacking
+/// titles.
+fn thread_summary(payload: &Value, mtime: std::time::SystemTime) -> Option<Value> {
+    if !is_neo_thread(payload) {
+        return None;
+    }
+    let id = payload.get("id").and_then(|s| s.as_str()).unwrap_or("");
+    if id.is_empty() {
+        return None;
+    }
+    let title = payload.get("title").cloned().unwrap_or(Value::Null);
+    let created = payload.get("created").cloned().unwrap_or(Value::Null);
+    let agent_mode = payload
+        .get("agentMode")
+        .cloned()
+        .unwrap_or_else(|| Value::String("smart".to_string()));
+    let message_count = payload
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let updated_at = chrono::DateTime::<chrono::Utc>::from(mtime).to_rfc3339();
+    // amp's CLI thread list reads `userLastInteractedAt` and feeds it
+    // to `new Date(...).toISOString()`. Without this field amp crashes
+    // with `RangeError: Invalid Date`. We mirror `updatedAt` since
+    // we can't tell the two apart without amp's own activity tracking.
+    Some(json!({
+        "id": id,
+        "title": title,
+        "agentMode": agent_mode,
+        "created": created,
+        "updatedAt": updated_at,
+        "userLastInteractedAt": updated_at,
+        "messageCount": message_count,
+        "creatorUserID": "user_aivo_local",
+        // Neo's switch picker hard-derefs `relationships.find` per row; omit it and the picker build crashes.
+        "relationships": [],
+    }))
+}
+
+/// Serves amp's Librarian tool + the `amp threads <query>` CLI, both of
+/// which issue `GET /api/threads/find?q=<query>&limit=N&offset=M` and
+/// parse `{threads:[...], hasMore:bool}`. Each row carries the same
+/// fields as `list_threads` plus an optional `matchedSearchText`
+/// snippet. Returns `(page, has_more)`.
+///
+/// The real ampcode.com backend does server-side full-text search with
+/// boolean operators; locally we scan the on-disk neo threads
+/// (most-recent first) and keep any whose title or message text
+/// contains a query token (case-insensitive). `OR`/`AND` keywords are
+/// dropped, so the Librarian's habitual `term OR misspelling` queries
+/// match either spelling. An empty/all-operator query lists everything,
+/// like the bare CLI.
+pub async fn find_threads(
+    dir: &Path,
+    query: &str,
+    limit: usize,
+    offset: usize,
+) -> (Vec<Value>, bool) {
+    let tokens: Vec<String> = query
+        .split_whitespace()
+        .filter(|t| !t.eq_ignore_ascii_case("or") && !t.eq_ignore_ascii_case("and"))
+        .map(str::to_ascii_lowercase)
+        .filter(|t| !t.is_empty())
+        .collect();
+
+    let Ok(mut rd) = fs::read_dir(dir).await else {
+        return (Vec::new(), false);
+    };
+    let mut entries: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata().await else {
+            continue;
+        };
+        let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        entries.push((mtime, path));
+    }
+    entries.sort_by_key(|e| std::cmp::Reverse(e.0));
+
+    // Collect every match first (cheap — title + text scan per file),
+    // then page with offset/limit so `hasMore` is accurate.
+    let mut matched: Vec<Value> = Vec::new();
+    for (mtime, path) in entries {
+        let Ok(bytes) = fs::read(&path).await else {
+            continue;
+        };
+        let Ok(payload) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        let Some(mut summary) = thread_summary(&payload, mtime) else {
+            continue;
+        };
+        let haystack = thread_search_text(&payload);
+        let haystack_lc = haystack.to_lowercase();
+        let hit = tokens.is_empty() || tokens.iter().any(|t| haystack_lc.contains(t));
+        if !hit {
+            continue;
+        }
+        if let Some(snippet) = matched_snippet(&haystack, &haystack_lc, &tokens) {
+            summary["matchedSearchText"] = Value::String(snippet);
+        }
+        matched.push(summary);
+    }
+
+    let total = matched.len();
+    let page: Vec<Value> = matched.into_iter().skip(offset).take(limit).collect();
+    let has_more = offset.saturating_add(page.len()) < total;
+    (page, has_more)
+}
+
+/// Concatenates a thread's title + every message's text content into one
+/// searchable string. tool_use/tool_result and other non-text blocks are
+/// skipped — the Librarian searches conversational text, not tool I/O.
+fn thread_search_text(payload: &Value) -> String {
+    let mut buf = String::new();
+    if let Some(t) = payload.get("title").and_then(|v| v.as_str()) {
+        buf.push_str(t);
+        buf.push('\n');
+    }
+    let Some(messages) = payload.get("messages").and_then(|m| m.as_array()) else {
+        return buf;
+    };
+    for msg in messages {
+        match msg.get("content") {
+            Some(Value::String(s)) => {
+                buf.push_str(s);
+                buf.push('\n');
+            }
+            Some(Value::Array(blocks)) => {
+                for b in blocks {
+                    if b.get("type").and_then(|t| t.as_str()) == Some("text")
+                        && let Some(t) = b.get("text").and_then(|v| v.as_str())
+                    {
+                        buf.push_str(t);
+                        buf.push('\n');
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    buf
+}
+
+/// A short context window around the first matching token, for the
+/// Librarian's `matchedSearchText`. Best-effort + cosmetic: the field is
+/// optional (amp guards it with `?.`), so any miss just omits it.
+fn matched_snippet(text: &str, text_lc: &str, tokens: &[String]) -> Option<String> {
+    const WINDOW: usize = 80;
+    let pos = tokens.iter().filter_map(|t| text_lc.find(t.as_str())).min()?;
+    let start = floor_char_boundary(text, pos.saturating_sub(WINDOW));
+    let end = ceil_char_boundary(text, (pos + WINDOW).min(text.len()));
+    // Collapse whitespace so the snippet stays on one line.
+    let mut snippet = text[start..end].split_whitespace().collect::<Vec<_>>().join(" ");
+    if snippet.is_empty() {
+        return None;
+    }
+    if start > 0 {
+        snippet.insert(0, '…');
+    }
+    if end < text.len() {
+        snippet.push('…');
+    }
+    Some(snippet)
+}
+
+/// `str::floor_char_boundary` is still unstable, so snap manually: walk
+/// back to the nearest UTF-8 boundary at or before `i`.
+fn floor_char_boundary(s: &str, mut i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Nearest UTF-8 boundary at or after `i`.
+fn ceil_char_boundary(s: &str, mut i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
 }
 
 /// Parse amp's `created` field — a unix-ms integer (older threads) or an
@@ -456,6 +618,120 @@ mod tests {
             json!([]),
             "every listThreads row needs a `relationships` array or neo's picker build crashes"
         );
+    }
+
+    /// find_threads backs amp's Librarian + `amp threads <query>` CLI.
+    /// It matches the query against title + message text (case-insensitive,
+    /// `OR`/`AND` dropped), returns most-recent-first, and surfaces a
+    /// `matchedSearchText` snippet so the Librarian sees why a thread hit.
+    #[tokio::test]
+    async fn find_threads_matches_title_and_body_case_insensitively() {
+        let dir = tempfile::tempdir().unwrap();
+        let mk = |id: &str, title: &str, text: &str| {
+            json!({
+                "id": id, "v": 2, "title": title,
+                "created": "2026-05-28T00:00:00Z", "agentMode": "smart",
+                "messages": [{"role": "user", "content": [{"type": "text", "text": text}]}],
+            })
+        };
+        for (i, t) in [
+            mk("T-aaa", "Refactor parser", "nothing relevant here"),
+            mk("T-bbb", "Daily notes", "We discussed the Librarian tool design"),
+            mk("T-ccc", "LIBRARIAN deep dive", "more text"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            save_thread(dir.path(), &t).await.unwrap();
+            let _ = i;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // `librarian OR libraian`: OR is dropped, either token matches.
+        let (hits, has_more) = find_threads(dir.path(), "librarian OR libraian", 10, 0).await;
+        let ids: Vec<&str> = hits.iter().map(|t| t["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["T-ccc", "T-bbb"], "title + body match, recency order");
+        assert!(!has_more);
+        // Body match carries a snippet naming the term.
+        let bbb = hits.iter().find(|t| t["id"] == "T-bbb").unwrap();
+        assert!(
+            bbb["matchedSearchText"]
+                .as_str()
+                .unwrap_or("")
+                .to_lowercase()
+                .contains("librarian"),
+            "snippet should quote the matched text, got {bbb:?}"
+        );
+        // Shape the Librarian client reads.
+        assert!(bbb["title"].is_string());
+        assert_eq!(bbb["creatorUserID"], "user_aivo_local");
+        assert!(bbb["updatedAt"].is_string());
+    }
+
+    #[tokio::test]
+    async fn find_threads_paginates_with_offset_limit_and_has_more() {
+        let dir = tempfile::tempdir().unwrap();
+        for n in 0..5 {
+            let t = json!({
+                "id": format!("T-{n}{n}{n}"), "v": 2, "title": format!("topic {n}"),
+                "created": "2026-05-28T00:00:00Z",
+                "messages": [{"role": "user", "content": [{"type": "text", "text": "shared keyword"}]}],
+            });
+            save_thread(dir.path(), &t).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // First page of 2 of 5 → hasMore.
+        let (page1, more1) = find_threads(dir.path(), "keyword", 2, 0).await;
+        assert_eq!(page1.len(), 2);
+        assert!(more1);
+        // Last page exhausts the set → no more.
+        let (page3, more3) = find_threads(dir.path(), "keyword", 2, 4).await;
+        assert_eq!(page3.len(), 1);
+        assert!(!more3);
+    }
+
+    #[tokio::test]
+    async fn find_threads_empty_query_lists_all_and_skips_pre_neo() {
+        let dir = tempfile::tempdir().unwrap();
+        save_thread(
+            dir.path(),
+            &json!({"id": "T-neo", "v": 2, "title": "kept",
+                    "created": "2026-05-28T00:00:00Z", "messages": []}),
+        )
+        .await
+        .unwrap();
+        // Pre-neo (v=23) must never surface, even on an empty query.
+        save_thread(
+            dir.path(),
+            &json!({"id": "T-old", "v": 23, "created": 1778213296920u64, "messages": []}),
+        )
+        .await
+        .unwrap();
+        let (hits, _) = find_threads(dir.path(), "  ", 10, 0).await;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["id"], "T-neo");
+    }
+
+    /// A multibyte body must not panic the snippet windower (char-boundary
+    /// snapping) and a non-matching query must return nothing.
+    #[tokio::test]
+    async fn find_threads_handles_unicode_body_and_no_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!("{}librarian{}", "日本語".repeat(40), "café ☕".repeat(40));
+        save_thread(
+            dir.path(),
+            &json!({"id": "T-uni", "v": 2, "title": "unicode",
+                    "created": "2026-05-28T00:00:00Z",
+                    "messages": [{"role": "user", "content": [{"type": "text", "text": body}]}]}),
+        )
+        .await
+        .unwrap();
+        let (hit, _) = find_threads(dir.path(), "librarian", 10, 0).await;
+        assert_eq!(hit.len(), 1);
+        assert!(hit[0]["matchedSearchText"].is_string());
+        let (miss, more) = find_threads(dir.path(), "zzzznomatch", 10, 0).await;
+        assert!(miss.is_empty());
+        assert!(!more);
     }
 
     #[tokio::test]
