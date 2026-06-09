@@ -2139,7 +2139,7 @@ async fn agent_turn_finish(
         return;
     }
 
-    let blocks = match call_result {
+    let (blocks, turn_usage) = match call_result {
         Ok(b) => b,
         Err(e) => {
             let err_msg = e.to_string();
@@ -2220,7 +2220,7 @@ async fn agent_turn_finish(
     }));
 
     let has_tools = !tool_leases.is_empty();
-    let final_msg = json!({
+    let mut final_msg = json!({
         "threadId": ws_state.thread_id,
         "role": "assistant",
         "messageId": assistant_message_id.clone(),
@@ -2228,6 +2228,11 @@ async fn agent_turn_finish(
         "state": {"type": "complete"},
         "createdAt": chrono::Utc::now().to_rfc3339(),
     });
+    // Carry the turn's token usage on the persisted message (pre-neo amp's own
+    // schema), so `--aivo-stats` reads it back per session.
+    if let Some(u) = turn_usage {
+        final_msg["usage"] = u;
+    }
     ws_state.persisted_messages.push(final_msg.clone());
     ws_state
         .persisted_to_msgs_idx
@@ -2589,7 +2594,7 @@ async fn call_upstream_chat_streaming(
     skills: &[serde_json::Value],
     guidance_files: &[serde_json::Value],
     agent_mode: Option<&str>,
-) -> Result<Vec<serde_json::Value>> {
+) -> Result<(Vec<serde_json::Value>, Option<serde_json::Value>)> {
     let model = state
         .config
         .force_model
@@ -2654,8 +2659,10 @@ async fn call_upstream_chat_streaming(
                     body.chars().take(400).collect::<String>()
                 );
             }
+            let mut turn_usage = None;
             if let Some(usage) = crate::usage::parse_token_usage(body.as_bytes()) {
                 record_amp_usage(&state.config, &model, &usage).await;
+                turn_usage = Some(amp_message_usage(&model, &usage));
             }
             let parsed: serde_json::Value = serde_json::from_str(&body)
                 .map_err(|e| anyhow::anyhow!("parse upstream JSON: {e}"))?;
@@ -2679,7 +2686,7 @@ async fn call_upstream_chat_streaming(
                 cancel_flag,
             )
             .await;
-            Ok(blocks)
+            Ok((blocks, turn_usage))
         }
         BridgeResponse::Streaming {
             status, upstream, ..
@@ -2703,12 +2710,28 @@ async fn call_upstream_chat_streaming(
                 &mut sniffer,
             )
             .await?;
+            let mut turn_usage = None;
             if let Some(usage) = sniffer.finish() {
                 record_amp_usage(&state.config, &model, &usage).await;
+                turn_usage = Some(amp_message_usage(&model, &usage));
             }
-            Ok(blocks)
+            Ok((blocks, turn_usage))
         }
     }
+}
+
+/// Amp-thread-schema usage object stamped onto the persisted assistant message
+/// (`model` + camelCase token fields) — the shape pre-neo amp wrote and
+/// `collect_thread_sessions` reads, so `--aivo-stats` windows neo turns too
+/// (neo amp's own uploads carry no usage).
+fn amp_message_usage(model: &str, usage: &crate::usage::TokenUsage) -> serde_json::Value {
+    json!({
+        "model": model,
+        "inputTokens": usage.prompt,
+        "outputTokens": usage.completion,
+        "cacheReadInputTokens": usage.cache_read,
+        "cacheCreationInputTokens": usage.cache_creation,
+    })
 }
 
 /// Record one LLM turn's token usage against the configured stats key, labeled

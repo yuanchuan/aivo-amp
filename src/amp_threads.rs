@@ -626,7 +626,10 @@ pub struct ModelUsage {
 
 /// One thread's per-model usage plus its creation time. `created` is `None`
 /// when the thread carries no recognizable `created` field (the host then can't
-/// time-filter it). Only threads with ≥1 usage-bearing turn are emitted.
+/// time-filter it). A thread with messages but no usage-bearing turn is still a
+/// session (empty `by_model`): the bridge stamps usage onto neo turns, but
+/// cancelled/errored turns and pre-stamp threads carry none, and the session
+/// count shouldn't depend on it. Message-less threads are skipped as noise.
 #[derive(Debug, Clone)]
 pub struct ThreadUsage {
     pub created: Option<chrono::DateTime<chrono::Utc>>,
@@ -677,7 +680,7 @@ pub async fn collect_thread_sessions(dir: &Path) -> Vec<ThreadUsage> {
             e.cache_read += n("cacheReadInputTokens");
             e.cache_write += n("cacheCreationInputTokens");
         }
-        if !by_model.is_empty() {
+        if !by_model.is_empty() || !messages.is_empty() {
             out.push(ThreadUsage { created, by_model });
         }
     }
@@ -1013,17 +1016,32 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        // A thread with no usage-bearing turn is omitted entirely.
+        // A thread with messages but no usage-bearing turn (neo uploads carry
+        // no usage; a cancelled turn never got stamped) still counts as a
+        // session — with its RFC3339 `created` parsed for windowing.
+        std::fs::write(
+            dir.path().join("T-usageless.json"),
+            json!({"id": "T-usageless", "v": 2, "created": "2026-06-09T18:41:09.622967+00:00",
+                   "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]})
+            .to_string(),
+        )
+        .unwrap();
+        // A message-less thread is noise, not a session.
         std::fs::write(
             dir.path().join("T-empty.json"),
             json!({"id": "T-empty", "v": 2, "created": 1_700_000_000_001i64,
-                   "messages": [{"role": "user", "content": []}]})
+                   "messages": []})
             .to_string(),
         )
         .unwrap();
 
-        let sessions = collect_thread_sessions(dir.path()).await;
-        assert_eq!(sessions.len(), 1, "empty thread is dropped");
+        let mut sessions = collect_thread_sessions(dir.path()).await;
+        sessions.sort_by_key(|s| s.created);
+        assert_eq!(
+            sessions.len(),
+            2,
+            "usage + usage-less sessions, empty dropped"
+        );
         let s = &sessions[0];
         // created (unix-ms 1_700_000_000_000 → 2023-11-14T...) parsed.
         assert_eq!(s.created.unwrap().timestamp(), 1_700_000_000);
@@ -1032,6 +1050,16 @@ mod tests {
             (ds.input, ds.output, ds.cache_read, ds.cache_write),
             (15, 120, 1500, 50),
             "turns within the session are summed"
+        );
+        let u = &sessions[1];
+        assert!(
+            u.by_model.is_empty(),
+            "usage-less session carries no models"
+        );
+        assert_eq!(
+            u.created.unwrap().to_rfc3339(),
+            "2026-06-09T18:41:09.622967+00:00",
+            "neo string `created` parsed for windowing"
         );
     }
 

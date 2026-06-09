@@ -86,9 +86,12 @@ async fn run() -> i32 {
 /// consumes the `raw-key`/`endpoint` env handoff (which is why neither is
 /// declared). `config-read`/`config-write` read and persist to aivo's key store
 /// (active/starter key, learned routes) and shared `logs.db`; `spawn` launches
-/// the real `amp` binary. `transcripts: {format:"native"}` opts amp into
-/// `aivo share` via native export (`--aivo-export-transcript` → our own
-/// `SharePayload`, `source: amp`).
+/// the real `amp` binary. `stats` is kept for hosts predating automatic
+/// coding-agent probing (≤ v0.27.1 gate the `--aivo-stats` probe on this cap;
+/// newer hosts probe every coding-agent plugin and treat `stats` as a
+/// non-coding-agent opt-in). `transcripts: {format:"native"}` opts amp into `aivo
+/// share` via native export (`--aivo-export-transcript` → our own `SharePayload`,
+/// `source: amp`).
 fn print_manifest() {
     // Build the manifest as raw JSON rather than aivo's `PluginManifest` type:
     // that type is `pub(crate)` by design, since the protocol boundary is
@@ -104,7 +107,7 @@ fn print_manifest() {
         // amp's own `--help` already lists -k/-m/--debug (with amp-specific
         // descriptions), so tell aivo to skip its duplicate help banner.
         "documents_aivo_flags": true,
-        "capabilities": ["config-read", "config-write", "spawn"],
+        "capabilities": ["config-read", "config-write", "spawn", "stats"],
         // amp emits its own transcript (--aivo-export-transcript) → source: amp.
         "transcripts": { "format": "native" },
         "requires": [{ "bin": "amp", "install": "npm install -g @ampcode/cli" }],
@@ -191,9 +194,16 @@ async fn print_stats() {
 }
 
 async fn launch_amp(launch: cli::LaunchCli) -> anyhow::Result<i32> {
-    // Activate trace logging if requested via flag or host-provided env.
+    // Activate trace logging (`--debug` flag or host `AIVO_DEBUG_LOG`) and print
+    // the path. The host prints nothing for a fat plugin (no `endpoint` cap), so
+    // without this `--debug` looks dead. Mirrors `aivo run --debug`.
     if let Some(path) = debug_log_path(&launch) {
-        let _ = aivo::services::http_debug::init(path).await;
+        match aivo::services::http_debug::init(path).await {
+            Ok(p) => eprintln!("[aivo] HTTP debug log → {}", p.display()),
+            Err(e) => {
+                eprintln!("[aivo] failed to open debug log: {e}; HTTP requests will not be logged")
+            }
+        }
     }
 
     // Opt-in management-plane passthrough. SAFETY: current_thread runtime, set
