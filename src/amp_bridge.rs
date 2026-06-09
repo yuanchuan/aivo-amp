@@ -1193,9 +1193,9 @@ async fn ws_followup_events(
             if let Some(names) = params.get("toolNames").and_then(|v| v.as_array()) {
                 let drop: std::collections::HashSet<&str> =
                     names.iter().filter_map(|n| n.as_str()).collect();
-                ws_state
-                    .tools
-                    .retain(|t| !drop.contains(t.get("name").and_then(|v| v.as_str()).unwrap_or("")));
+                ws_state.tools.retain(|t| {
+                    !drop.contains(t.get("name").and_then(|v| v.as_str()).unwrap_or(""))
+                });
             }
         }
         // amp's outbox retries this every ~500ms until it sees a
@@ -6412,7 +6412,11 @@ mod tests {
             .iter()
             .filter_map(|t| t["name"].as_str())
             .collect();
-        assert_eq!(names, vec!["Bash", "Read"], "only the named tool is dropped");
+        assert_eq!(
+            names,
+            vec!["Bash", "Read"],
+            "only the named tool is dropped"
+        );
     }
 
     /// neo fires read-state / error-dismiss notifications
