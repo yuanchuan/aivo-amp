@@ -66,8 +66,36 @@ jobs:
             echo "asset=$out" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Upload to release
-        if: startsWith(github.ref, 'refs/tags/')
+      # Hand the binary to the single `release` job instead of uploading it to
+      # the GitHub release here: five parallel matrix jobs each find-or-creating
+      # the same release races, and when two create it concurrently GitHub
+      # returns `already_exists`, leaving a duplicate draft + a failed job (seen
+      # on v0.1.2). One artifact per target — names are unique.
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ steps.pkg.outputs.asset }}
+          if-no-files-found: error
+
+  # A single job creates/updates the release once, after every target built, so
+  # there is no concurrent release creation to race. Tag pushes only — a
+  # `workflow_dispatch` run still exercises the matrix build but publishes
+  # nothing (no tag to attach to).
+  release:
+    name: publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all target binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ steps.pkg.outputs.asset }}
+          files: dist/*
+          fail_on_unmatched_files: true
