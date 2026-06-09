@@ -28,7 +28,7 @@ The plugin adds a few flags of its own:
 
 | Option | Meaning |
 | --- | --- |
-| `--mode <smart\|rush\|deep\|large>` | Pin the initial agent mode. |
+| `--mode [<smart\|rush\|deep\|large>]` | Pin the initial agent mode; bare `--mode` opens a picker. |
 | `--rush-model` / `--smart-model` / `--deep-model` / `--large-model` | Per-mode model override. |
 | `--disable-tool <name>` | Strip a tool from Amp's upstream request (repeatable). |
 | `--passthrough` | Forward Amp's management plane upstream instead of stubbing it. |

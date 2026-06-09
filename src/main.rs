@@ -23,7 +23,7 @@ use aivo::services::key_compat::KeyCompatContext;
 use aivo::services::session_store::SessionStore;
 use aivo::style;
 
-use crate::mode_models::AMP_AGENT_MODES;
+use crate::mode_models::{AMP_AGENT_MODE_DESCRIPTIONS, AMP_AGENT_MODES};
 
 // current_thread runtime: the ported `ensure_loopback_no_proxy_in_process_env`
 // mutates process env, which is only sound on a single-threaded runtime.
@@ -202,15 +202,23 @@ async fn launch_amp(launch: cli::LaunchCli) -> anyhow::Result<i32> {
         unsafe { std::env::set_var("AIVO_AMP_PASSTHROUGH", "1") };
     }
 
-    // Validate the initial mode up front (matches aivo's run.rs gate).
-    let modes = launch.to_mode_models();
-    if let Some(mode) = modes.initial_mode.as_deref().map(str::trim)
-        && !AMP_AGENT_MODES.contains(&mode)
-    {
-        anyhow::bail!(
-            "unknown --mode '{mode}'. Valid: {}",
-            AMP_AGENT_MODES.join(", ")
-        );
+    // Resolve the initial mode (matches aivo's run.rs gate). Bare `--mode`
+    // (empty value) opens an interactive picker; an explicit value is
+    // validated against amp's catalog.
+    let mut modes = launch.to_mode_models();
+    match modes.initial_mode.as_deref().map(str::trim) {
+        Some("") => match pick_amp_mode() {
+            Some(chosen) => modes.initial_mode = Some(chosen),
+            // Esc/Ctrl-C in the picker: exit cleanly, like a cancelled key picker.
+            None => return Ok(ExitCode::Success.code()),
+        },
+        Some(mode) if !AMP_AGENT_MODES.contains(&mode) => {
+            anyhow::bail!(
+                "unknown --mode '{mode}'. Valid: {}",
+                AMP_AGENT_MODES.join(", ")
+            );
+        }
+        _ => {}
     }
 
     let store = session_store();
@@ -265,6 +273,28 @@ async fn launch_amp(launch: cli::LaunchCli) -> anyhow::Result<i32> {
     };
     let model = model_owned.as_deref();
     launch::run_amp(&store, &key, model, &modes, &launch.amp_args).await
+}
+
+/// Interactive picker for bare `--mode`. Lists amp's agent modes with their
+/// descriptions and returns the chosen mode name, or `None` if the user
+/// cancelled (Esc/Ctrl-C) or the terminal isn't interactive. Mirrors the
+/// `-k`/`-m` picker UX (`aivo::tui::FuzzySelect`, rendering on stderr).
+fn pick_amp_mode() -> Option<String> {
+    // Pad the mode column to the widest name so the `—` separators and the
+    // descriptions line up. Mode names are ASCII, so byte length == columns.
+    let width = AMP_AGENT_MODES.iter().map(|m| m.len()).max().unwrap_or(0);
+    let items: Vec<String> = AMP_AGENT_MODES
+        .iter()
+        .zip(AMP_AGENT_MODE_DESCRIPTIONS.iter())
+        .map(|(mode, desc)| format!("{mode:<width$}  —  {desc}"))
+        .collect();
+    let idx = aivo::tui::FuzzySelect::new()
+        .with_prompt("Select agent mode")
+        .items(&items)
+        .interact_opt()
+        .ok()
+        .flatten()?;
+    AMP_AGENT_MODES.get(idx).map(|m| m.to_string())
 }
 
 /// Resolves the session store from the host-provided config dir, falling back

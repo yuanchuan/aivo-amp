@@ -49,8 +49,9 @@ pub struct LaunchCli {
     #[arg(short = 'm', long = "model", num_args = 0..=1, default_missing_value = "", value_name = "MODEL")]
     pub model: Option<String>,
 
-    /// Pin the initial agent mode: smart | rush | deep | large.
-    #[arg(long = "mode", value_name = "MODE")]
+    /// Pin the initial agent mode: smart | rush | deep | large. Bare `--mode`
+    /// opens an interactive picker.
+    #[arg(long = "mode", num_args = 0..=1, default_missing_value = "", value_name = "MODE")]
     pub mode: Option<String>,
 
     /// Per-mode model override for `rush`.
@@ -96,5 +97,38 @@ impl LaunchCli {
             disable_tools: self.disable_tool.clone(),
             initial_mode: self.mode.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Bare `--mode` parses to `Some("")`, the sentinel `launch_amp` turns into
+    /// an interactive picker (mirrors bare `-k`/`-m`).
+    #[test]
+    fn bare_mode_flag_parses_as_empty() {
+        let cli = LaunchCli::try_parse_from(["aivo-amp", "--mode"]).unwrap();
+        assert_eq!(cli.mode.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn explicit_mode_value_parses() {
+        let cli = LaunchCli::try_parse_from(["aivo-amp", "--mode", "deep"]).unwrap();
+        assert_eq!(cli.mode.as_deref(), Some("deep"));
+    }
+
+    /// Bare `--mode` must not swallow a following flag as its value.
+    #[test]
+    fn bare_mode_does_not_consume_following_flag() {
+        let cli = LaunchCli::try_parse_from(["aivo-amp", "--mode", "--debug"]).unwrap();
+        assert_eq!(cli.mode.as_deref(), Some(""));
+        assert!(cli.debug.is_some());
+    }
+
+    #[test]
+    fn no_mode_flag_is_none() {
+        let cli = LaunchCli::try_parse_from(["aivo-amp"]).unwrap();
+        assert_eq!(cli.mode, None);
     }
 }

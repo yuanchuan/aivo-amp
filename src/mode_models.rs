@@ -29,6 +29,15 @@ pub struct AmpModeModels {
 /// `--mode` validation.
 pub const AMP_AGENT_MODES: [&str; 4] = ["smart", "rush", "deep", "large"];
 
+/// One-line description per mode, same order as [`AMP_AGENT_MODES`], mirrored
+/// from amp's own mode catalog. Shown as the dim hint in the `--mode` picker.
+pub const AMP_AGENT_MODE_DESCRIPTIONS: [&str; 4] = [
+    "Strong intelligence for any task",
+    "Fast, low-token mode for small, well-defined tasks",
+    "The most capable coding mode with deep reasoning",
+    "The biggest context window possible (1M tokens), for large tasks",
+];
+
 impl AmpModeModels {
     /// Renders the override as the JSON object form amp expects:
     /// `{"<mode>": "<provider>:<model>", ...}`. Modes with no override
@@ -57,5 +66,18 @@ impl AmpModeModels {
         } else {
             Some(Value::Object(obj))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `--mode` picker zips modes with descriptions; a length mismatch
+    /// would silently drop the trailing mode(s) from the picker.
+    #[test]
+    fn modes_and_descriptions_stay_aligned() {
+        assert_eq!(AMP_AGENT_MODES.len(), AMP_AGENT_MODE_DESCRIPTIONS.len());
+        assert!(AMP_AGENT_MODE_DESCRIPTIONS.iter().all(|d| !d.is_empty()));
     }
 }
