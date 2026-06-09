@@ -657,6 +657,100 @@ fn ensure_tool_use_id(block: &mut serde_json::Value) -> Option<String> {
     Some(id)
 }
 
+// A tool result has two on-the-wire shapes that share `type:"tool_result"`
+// but differ in their id field, so the field name disambiguates them:
+//
+//   amp neo  : {type:"tool_result", toolUseID, run:{status, result, …}}
+//   Anthropic: {type:"tool_result", tool_use_id, content, is_error}
+//
+// amp's thread store + reload path speak neo; the upstream LLM speaks
+// Anthropic. We persist neo so `amp threads continue` / the thread
+// switcher can reload a thread that contains tool calls — with the
+// Anthropic shape, amp's loader reads `block.toolUseID` (undefined) and
+// runs `M-${undefined.replace(/^TU-/,"")}`, throwing "undefined is not an
+// object (evaluating 'R.replace')" (the stuck half of aivo#14). Both
+// converters are shape-aware and idempotent: a block already in the
+// target shape (or a non-tool_result block) passes through untouched, so
+// they also upconvert *legacy* threads persisted in the Anthropic shape
+// before this fix.
+
+fn is_tool_result(block: &serde_json::Value) -> bool {
+    block.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+}
+
+/// neo → Anthropic, for blocks fed to the upstream LLM.
+fn block_to_anthropic(block: &serde_json::Value) -> serde_json::Value {
+    // Not a tool_result, or already Anthropic → leave it alone.
+    if !is_tool_result(block) || block.get("tool_use_id").is_some() {
+        return block.clone();
+    }
+    let run = block.get("run");
+    let status = run
+        .and_then(|r| r.get("status"))
+        .and_then(|s| s.as_str())
+        .unwrap_or("error");
+    let content = match run.and_then(|r| r.get("result")) {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(v) => v.to_string(),
+        None => format!("(tool exited with status: {status})"),
+    };
+    json!({
+        "type": "tool_result",
+        "tool_use_id": block.get("toolUseID").cloned().unwrap_or_else(|| json!("")),
+        "content": content,
+        "is_error": status != "done",
+    })
+}
+
+/// Anthropic → neo, for blocks served to amp's TUI / reload path.
+fn block_to_neo(block: &serde_json::Value) -> serde_json::Value {
+    // Not a tool_result, or already neo → leave it alone.
+    if !is_tool_result(block) || block.get("toolUseID").is_some() {
+        return block.clone();
+    }
+    let is_error = block
+        .get("is_error")
+        .and_then(|b| b.as_bool())
+        .unwrap_or(false);
+    json!({
+        "type": "tool_result",
+        "toolUseID": block.get("tool_use_id").cloned().unwrap_or_else(|| json!("")),
+        "run": {
+            "status": if is_error { "error" } else { "done" },
+            "result": block.get("content").cloned().unwrap_or_else(|| json!("")),
+        },
+    })
+}
+
+/// Applies `f` to every content block of a message `content` value
+/// (block-array messages only; strings/other shapes pass through).
+fn map_content_blocks(
+    content: &serde_json::Value,
+    f: fn(&serde_json::Value) -> serde_json::Value,
+) -> serde_json::Value {
+    match content {
+        serde_json::Value::Array(blocks) => {
+            serde_json::Value::Array(blocks.iter().map(f).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+/// Normalizes every message's content in a loaded thread payload to amp's
+/// neo shape before serving it to amp (getThread / getThreadTail). Makes
+/// both freshly-persisted (already-neo) and legacy (Anthropic) threads
+/// reload without the `toolUseID`-undefined crash.
+fn normalize_thread_payload_to_neo(payload: &mut serde_json::Value) {
+    if let Some(messages) = payload.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        for msg in messages {
+            if let Some(content) = msg.get("content") {
+                let neo = map_content_blocks(content, block_to_neo);
+                msg["content"] = neo;
+            }
+        }
+    }
+}
+
 /// Extracts the first text from a user message's `content`, whether
 /// it's a plain string or an Anthropic-style content-block array.
 /// Returns an empty string when nothing usable is found.
@@ -723,9 +817,11 @@ struct WsState {
     /// emits tool_use blocks; cleared as `executor_tool_result`
     /// messages arrive.
     pending_tool_uses: std::collections::HashSet<String>,
-    /// tool_use_id → Anthropic tool_result block, accumulated as the
-    /// executor returns each. When `pending_tool_uses` is empty, these
-    /// get folded into a user message and the LLM is called again.
+    /// amp neo tool_result blocks (`{type, toolUseID, run}`), accumulated
+    /// as the executor returns each. When `pending_tool_uses` is empty
+    /// these fold into a user message: persisted verbatim (neo) and
+    /// converted to the Anthropic shape for the LLM via
+    /// `neo_block_to_anthropic`.
     tool_results: Vec<serde_json::Value>,
     /// Set of user `messageId`s we've already started processing. amp's
     /// outbox retries `client_append_user_msg` every ~500ms until it
@@ -893,9 +989,20 @@ impl WsState {
         for msg in messages {
             let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
             let content = msg.get("content").cloned().unwrap_or(json!([]));
-            self.messages
-                .push(json!({"role": role, "content": content}));
-            self.persisted_messages.push(msg.clone());
+            // `messages` feeds the upstream LLM (Anthropic tool_result
+            // shape); `persisted_messages` is replayed to amp's TUI on
+            // client_resume and re-saved by thread_payload, so normalize it
+            // to neo. Both converters are shape-aware, so a legacy thread
+            // persisted in the Anthropic shape upgrades cleanly on resume.
+            self.messages.push(json!({
+                "role": role,
+                "content": map_content_blocks(&content, block_to_anthropic),
+            }));
+            let mut neo_msg = msg.clone();
+            if let Some(c) = neo_msg.get("content") {
+                neo_msg["content"] = map_content_blocks(c, block_to_neo);
+            }
+            self.persisted_messages.push(neo_msg);
             self.persisted_to_msgs_idx.push(self.messages.len() - 1);
             if role == "user"
                 && let Some(id) = msg.get("messageId").and_then(|v| v.as_str())
@@ -1504,22 +1611,26 @@ async fn ws_followup_events(
                 return;
             };
             let tool_use_id_owned = tool_use_id.to_string();
-            let run = params.get("run").cloned().unwrap_or(json!({}));
-            let status = run
-                .get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("error");
-            let is_error = !matches!(status, "done");
-            let content = match run.get("result") {
-                Some(serde_json::Value::String(s)) => s.clone(),
-                Some(v) => v.to_string(),
-                None => format!("(tool exited with status: {status})"),
-            };
+            // Accumulate in amp's neo shape (`{toolUseID, run}`) — that's
+            // what we persist, and what `amp threads continue` reloads.
+            // `run` is the executor's own run object (status + result +
+            // any extras its renderer wants). amp dereferences
+            // `block.run.status` on reload, so guarantee an object with a
+            // status even if the executor sent neither. The Anthropic
+            // shape the model needs is derived later via
+            // neo_block_to_anthropic.
+            let mut run = params
+                .get("run")
+                .cloned()
+                .filter(serde_json::Value::is_object)
+                .unwrap_or_else(|| json!({}));
+            if run.get("status").and_then(|s| s.as_str()).is_none() {
+                run["status"] = json!("error");
+            }
             ws_state.tool_results.push(json!({
                 "type": "tool_result",
-                "tool_use_id": tool_use_id,
-                "content": content,
-                "is_error": is_error,
+                "toolUseID": tool_use_id,
+                "run": run,
             }));
             ws_state.pending_tool_uses.remove(tool_use_id);
 
@@ -1547,10 +1658,13 @@ async fn ws_followup_events(
                 // accumulated tool_result blocks and run another turn.
                 // Bootstrap is always complete by this point because
                 // tools_register fires before any tool can run.
-                let tool_result_blocks: Vec<_> = ws_state.tool_results.drain(..).collect();
+                let neo_blocks: Vec<_> = ws_state.tool_results.drain(..).collect();
+                // The model gets the Anthropic shape; the persisted
+                // fold-up (below) keeps the neo shape amp reloads.
+                let anthropic_blocks: Vec<_> = neo_blocks.iter().map(block_to_anthropic).collect();
                 ws_state.messages.push(json!({
                     "role": "user",
-                    "content": tool_result_blocks.clone(),
+                    "content": anthropic_blocks,
                 }));
                 // Persist the tool-result fold-up too. Without this,
                 // `amp threads continue T-<id>` resumes with no record
@@ -1563,7 +1677,7 @@ async fn ws_followup_events(
                     "threadId": ws_state.thread_id,
                     "role": "user",
                     "messageId": new_message_id(),
-                    "content": tool_result_blocks,
+                    "content": neo_blocks,
                     "createdAt": chrono::Utc::now().to_rfc3339(),
                 });
                 ws_state.persisted_messages.push(fold_msg);
@@ -3241,11 +3355,16 @@ async fn handle_internal_rpc(state: &AmpBridgeState, query: &str, body: &str) ->
                     .to_string();
             };
             match amp_threads::load_thread(dir, &id).await {
-                Some(payload) => json!({
-                    "ok": true,
-                    "result": {"thread": {"data": payload}},
-                })
-                .to_string(),
+                Some(mut payload) => {
+                    // Serve neo-shaped tool_result blocks so amp's loader
+                    // doesn't crash on legacy Anthropic-shaped threads.
+                    normalize_thread_payload_to_neo(&mut payload);
+                    json!({
+                        "ok": true,
+                        "result": {"thread": {"data": payload}},
+                    })
+                    .to_string()
+                }
                 None => r#"{"ok":false,"error":{"code":"thread-not-found","message":"Thread not found"}}"#
                     .to_string(),
             }
@@ -3268,7 +3387,17 @@ async fn handle_internal_rpc(state: &AmpBridgeState, query: &str, body: &str) ->
             let limit = amp_threads::extract_tail_limit(body);
             match amp_threads::load_thread_tail(dir, &id, limit).await {
                 Some((mut payload, tail)) => {
-                    let tail = serde_json::Value::Array(tail);
+                    let tail = serde_json::Value::Array(
+                        tail.iter()
+                            .map(|m| {
+                                let mut m = m.clone();
+                                if let Some(c) = m.get("content") {
+                                    m["content"] = map_content_blocks(c, block_to_neo);
+                                }
+                                m
+                            })
+                            .collect(),
+                    );
                     // Keep the thread object's own `messages` consistent
                     // with the tail so the merged preview thread is
                     // self-contained and we don't ship full history twice.
@@ -4343,6 +4472,84 @@ mod tests {
         state
     }
 
+    /// The two tool_result converters are shape-aware and idempotent, and
+    /// leave non-tool_result blocks untouched — the property that lets the
+    /// same code path handle both fresh (neo) and legacy (Anthropic) data.
+    #[test]
+    fn tool_result_converters_are_idempotent_and_passthrough() {
+        let anthropic = json!({"type": "tool_result", "tool_use_id": "TU-x",
+                               "content": "out", "is_error": true});
+        let neo = json!({"type": "tool_result", "toolUseID": "TU-x",
+                        "run": {"status": "error", "result": "out"}});
+
+        // Cross-convert lands on the other shape…
+        assert_eq!(block_to_neo(&anthropic)["toolUseID"], json!("TU-x"));
+        assert_eq!(block_to_neo(&anthropic)["run"]["status"], json!("error"));
+        assert_eq!(block_to_anthropic(&neo)["tool_use_id"], json!("TU-x"));
+        assert_eq!(block_to_anthropic(&neo)["is_error"], json!(true));
+
+        // …and re-applying the same direction is a no-op (already in shape).
+        assert_eq!(block_to_neo(&neo), neo);
+        assert_eq!(block_to_anthropic(&anthropic), anthropic);
+
+        // Non-tool_result blocks pass through both ways untouched.
+        for b in [
+            json!({"type": "text", "text": "hi"}),
+            json!({"type": "thinking", "thinking": "…", "signature": "sig"}),
+            json!({"type": "tool_use", "id": "TU-y", "name": "Bash", "input": {}}),
+        ] {
+            assert_eq!(block_to_neo(&b), b);
+            assert_eq!(block_to_anthropic(&b), b);
+        }
+    }
+
+    /// aivo#14 legacy threads: a thread persisted in the OLD Anthropic
+    /// tool_result shape (`tool_use_id`/`content`) must be served to amp
+    /// in the neo shape (`toolUseID`/`run`) — otherwise amp's loader runs
+    /// `M-${undefined.replace(...)}` and TypeErrors. getThread/getThreadTail
+    /// upconvert on the fly so already-saved threads load without migration.
+    #[tokio::test]
+    async fn get_thread_upconverts_legacy_anthropic_tool_results_to_neo() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "T-019e05ae-80a5-7718-80ee-ec89cb6fc1c0";
+        let tu = "TU-bbbbbbbbbbbbbbbbbbbbbb";
+        // Legacy on-disk shape (what every pre-fix thread looks like).
+        let payload = json!({
+            "id": id, "v": 2, "title": "legacy", "created": "2026-06-09T00:00:00Z",
+            "messages": [
+                {"role": "assistant", "messageId": "M-a0000000000000000000000",
+                 "content": [{"type": "tool_use", "id": tu, "name": "Bash", "input": {}}]},
+                {"role": "user", "messageId": "M-f0000000000000000000000",
+                 "content": [{"type": "tool_result", "tool_use_id": tu,
+                              "content": "legacy output", "is_error": false}]},
+            ],
+        });
+        amp_threads::save_thread(dir.path(), &payload)
+            .await
+            .unwrap();
+        let state = bridge_state_with_threads_dir(dir.path().to_path_buf());
+
+        for method in ["getThread", "getThreadTail"] {
+            let body =
+                format!(r#"{{"method":"{method}","params":{{"thread":"{id}","limit":76}}}}"#);
+            let resp = handle_internal_rpc(&state, method, &body).await;
+            let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+            let block = &v["result"]["thread"]["data"]["messages"][1]["content"][0];
+            // Served as neo: defined toolUseID (no R.replace crash) + run.
+            assert_eq!(block["toolUseID"].as_str(), Some(tu), "{method}");
+            assert_eq!(block["run"]["status"].as_str(), Some("done"), "{method}");
+            assert_eq!(
+                block["run"]["result"].as_str(),
+                Some("legacy output"),
+                "{method}"
+            );
+            assert!(
+                block["tool_use_id"].is_null(),
+                "{method}: snake_case id dropped"
+            );
+        }
+    }
+
     /// neo's switch-thread preview: `getThreadTail` must serve the
     /// thread object + message tail so the picker's preview pane renders.
     /// Regression for the empty "Preview Unavailable" pane (generic stub
@@ -4475,10 +4682,12 @@ mod tests {
         assert_eq!(ws_state.pending_tool_uses.len(), 1);
         assert!(ws_state.pending_tool_uses.contains(&tu_b));
         assert_eq!(ws_state.tool_results.len(), 1);
+        // Accumulated in amp's neo shape: {toolUseID, run:{status,result}}.
         let r = &ws_state.tool_results[0];
         assert_eq!(r["type"].as_str(), Some("tool_result"));
-        assert_eq!(r["content"].as_str(), Some("hello stdout"));
-        assert_eq!(r["is_error"].as_bool(), Some(false));
+        assert_eq!(r["toolUseID"].as_str(), Some(tu_a.as_str()));
+        assert_eq!(r["run"]["status"].as_str(), Some("done"));
+        assert_eq!(r["run"]["result"].as_str(), Some("hello stdout"));
 
         // We must ack the result back to the executor — otherwise
         // amp's TUI keeps the per-tool spinner on `::` indefinitely.
@@ -5027,8 +5236,60 @@ mod tests {
         assert!(fold_up["createdAt"].is_string());
         let blocks = fold_up["content"].as_array().unwrap();
         assert_eq!(blocks.len(), 1);
+        // Persisted in amp's neo shape so `threads continue` can reload a
+        // thread with tool calls (aivo#14: an Anthropic `tool_use_id`
+        // block leaves amp's `toolUseID` undefined → `R.replace` crash).
         assert_eq!(blocks[0]["type"].as_str(), Some("tool_result"));
-        assert_eq!(blocks[0]["content"].as_str(), Some("stdout text"));
+        assert_eq!(blocks[0]["toolUseID"].as_str(), Some(tu.as_str()));
+        assert_eq!(blocks[0]["run"]["status"].as_str(), Some("done"));
+        assert_eq!(blocks[0]["run"]["result"].as_str(), Some("stdout text"));
+    }
+
+    /// Round-trip: a persisted neo tool_result must (a) reload with a
+    /// defined `toolUseID` (so amp's loader doesn't TypeError) and (b)
+    /// rehydrate into the Anthropic `tool_use_id`/`content` shape the
+    /// upstream LLM expects on `amp threads continue`.
+    #[tokio::test]
+    async fn persisted_neo_tool_result_rehydrates_to_anthropic_for_llm() {
+        let dir = tempfile::tempdir().unwrap();
+        let tu = "TU-aaaaaaaaaaaaaaaaaaaaaa";
+        let payload = json!({
+            "id": "T-019e05ae-80a5-7718-80ee-ec89cb6fc1c0", "v": 2,
+            "title": "tool thread", "created": "2026-06-09T00:00:00Z",
+            "messages": [
+                {"role": "user", "messageId": "M-u0000000000000000000000",
+                 "content": [{"type": "text", "text": "run it"}]},
+                {"role": "assistant", "messageId": "M-a0000000000000000000000",
+                 "content": [{"type": "tool_use", "id": tu, "name": "Bash", "input": {}}]},
+                {"role": "user", "messageId": "M-f0000000000000000000000",
+                 "content": [{"type": "tool_result", "toolUseID": tu,
+                              "run": {"status": "error", "result": "boom"}}]},
+            ],
+        });
+        amp_threads::save_thread(dir.path(), &payload)
+            .await
+            .unwrap();
+
+        let mut ws_state = fake_ws_state();
+        ws_state.thread_id = "T-019e05ae-80a5-7718-80ee-ec89cb6fc1c0".to_string();
+        ws_state.hydrate_from_disk(dir.path()).await;
+
+        // On disk: neo shape preserved (toolUseID defined — no R.replace).
+        let disk = amp_threads::load_thread(dir.path(), &ws_state.thread_id)
+            .await
+            .unwrap();
+        let neo = &disk["messages"][2]["content"][0];
+        assert_eq!(neo["toolUseID"].as_str(), Some(tu));
+
+        // In the LLM history: converted to Anthropic shape.
+        let llm = ws_state.messages.last().unwrap();
+        let block = &llm["content"][0];
+        assert_eq!(block["type"].as_str(), Some("tool_result"));
+        assert_eq!(block["tool_use_id"].as_str(), Some(tu));
+        assert_eq!(block["content"].as_str(), Some("boom"));
+        assert_eq!(block["is_error"].as_bool(), Some(true));
+        // The assistant tool_use block (identical across formats) is intact.
+        assert_eq!(ws_state.messages[1]["content"][0]["id"].as_str(), Some(tu));
     }
 
     #[test]
@@ -5902,7 +6163,10 @@ mod tests {
         while let Some(_s) = rx.recv().await {
             emitted_any = true;
         }
-        assert!(!emitted_any, "no frames when the cancel was already handled");
+        assert!(
+            !emitted_any,
+            "no frames when the cancel was already handled"
+        );
     }
 
     /// An unrecognized `client_*` frame (amp's client protocol moved
@@ -6063,13 +6327,17 @@ mod tests {
             })
             .to_string();
             ws_followup_events(&state, &mut ws_state, &frame, &tx, None, "/test").await;
+            // Stored neo-shape, carrying the precise executor status.
             let r = &ws_state.tool_results[0];
-            assert_eq!(r["is_error"].as_bool(), Some(true), "status={status}");
-            // result was absent — fallback content includes the status.
+            assert_eq!(r["run"]["status"].as_str(), Some(status), "status={status}");
+            // Converting to the Anthropic shape maps non-done → is_error,
+            // and the result was absent so the fallback names the status.
+            let a = block_to_anthropic(r);
+            assert_eq!(a["is_error"].as_bool(), Some(true), "status={status}");
             assert!(
-                r["content"].as_str().unwrap_or("").contains(status),
+                a["content"].as_str().unwrap_or("").contains(status),
                 "status={status} content={:?}",
-                r["content"]
+                a["content"]
             );
         }
     }

@@ -313,11 +313,17 @@ fn thread_search_text(payload: &Value) -> String {
 /// optional (amp guards it with `?.`), so any miss just omits it.
 fn matched_snippet(text: &str, text_lc: &str, tokens: &[String]) -> Option<String> {
     const WINDOW: usize = 80;
-    let pos = tokens.iter().filter_map(|t| text_lc.find(t.as_str())).min()?;
+    let pos = tokens
+        .iter()
+        .filter_map(|t| text_lc.find(t.as_str()))
+        .min()?;
     let start = floor_char_boundary(text, pos.saturating_sub(WINDOW));
     let end = ceil_char_boundary(text, (pos + WINDOW).min(text.len()));
     // Collapse whitespace so the snippet stays on one line.
-    let mut snippet = text[start..end].split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut snippet = text[start..end]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     if snippet.is_empty() {
         return None;
     }
@@ -636,7 +642,11 @@ mod tests {
         };
         for (i, t) in [
             mk("T-aaa", "Refactor parser", "nothing relevant here"),
-            mk("T-bbb", "Daily notes", "We discussed the Librarian tool design"),
+            mk(
+                "T-bbb",
+                "Daily notes",
+                "We discussed the Librarian tool design",
+            ),
             mk("T-ccc", "LIBRARIAN deep dive", "more text"),
         ]
         .into_iter()
@@ -650,7 +660,11 @@ mod tests {
         // `librarian OR libraian`: OR is dropped, either token matches.
         let (hits, has_more) = find_threads(dir.path(), "librarian OR libraian", 10, 0).await;
         let ids: Vec<&str> = hits.iter().map(|t| t["id"].as_str().unwrap()).collect();
-        assert_eq!(ids, vec!["T-ccc", "T-bbb"], "title + body match, recency order");
+        assert_eq!(
+            ids,
+            vec!["T-ccc", "T-bbb"],
+            "title + body match, recency order"
+        );
         assert!(!has_more);
         // Body match carries a snippet naming the term.
         let bbb = hits.iter().find(|t| t["id"] == "T-bbb").unwrap();
