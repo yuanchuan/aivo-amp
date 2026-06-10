@@ -60,12 +60,25 @@ pub async fn run_amp(
     // native-amp-endpoint path (no bridge, nothing to learn).
     let mut route_caches: Vec<(&'static str, Arc<RouteCache>)> = Vec::new();
     if env.contains_key("AIVO_USE_AMP_BRIDGE") {
+        // Real limits of the model amp is forced to (cascade per the plugin
+        // protocol's `AIVO_MODEL_*` contract) — `for_amp` already resolved the
+        // effective wire model, starter default included.
+        let limits =
+            crate::model_limits::resolve(key, env.get("AIVO_AMP_FORCE_MODEL").map(String::as_str))
+                .await;
         // Seed each translator from the key's persisted amp routes so a repeat
         // launch skips the protocol probe — same as the native tools.
         let messages_seed = key.routes_for_tool(AMP_ROUTE_NS_MESSAGES);
         let responses_seed = key.routes_for_tool(AMP_ROUTE_NS_RESPONSES);
-        let (port, caches) =
-            start_amp_bridge(&mut env, messages_seed, responses_seed, store, &key.id).await?;
+        let (port, caches) = start_amp_bridge(
+            &mut env,
+            messages_seed,
+            responses_seed,
+            store,
+            &key.id,
+            limits,
+        )
+        .await?;
         route_caches = caches;
         env.insert("AMP_URL".to_string(), format!("http://127.0.0.1:{port}"));
         // Real key never reaches Amp; the bridge holds it and forwards.
@@ -281,6 +294,7 @@ async fn start_amp_bridge(
     responses_seed: BTreeMap<String, PersistedRoute>,
     store: &SessionStore,
     key_id: &str,
+    limits: crate::model_limits::ModelLimits,
 ) -> Result<(u16, Vec<(&'static str, Arc<RouteCache>)>)> {
     sweep_stale_amp_settings_files();
     let mut route_caches: Vec<(&'static str, Arc<RouteCache>)> = Vec::new();
@@ -321,6 +335,24 @@ async fn start_amp_bridge(
             env.remove("AIVO_AMP_INTERNAL_MODEL")
                 .map(serde_json::Value::String)
         });
+    // Believed-window snap (see `model_limits`): amp's context meter and
+    // compaction budget come from its compiled-in catalog entry for the mode's
+    // model, so when the real window is known, pin every mode to the catalog
+    // entry that matches it. Only when the wire model is forced (the bridge
+    // rewrites amp's model names regardless, so the believed name is purely
+    // amp-internal) and the user set no per-mode override of their own.
+    let default_internal_model: Option<serde_json::Value> =
+        match (&internal_model, &force_model, limits.context) {
+            (None, Some(_), Some(context)) => {
+                let snapped =
+                    crate::model_limits::snap_internal_model(context, limits.output).to_string();
+                let modes = crate::mode_models::AMP_AGENT_MODES
+                    .iter()
+                    .map(|mode| (mode.to_string(), serde_json::Value::String(snapped.clone())));
+                Some(serde_json::Value::Object(modes.collect()))
+            }
+            _ => None,
+        };
     let tools_disable: Vec<String> = env
         .remove("AIVO_AMP_TOOLS_DISABLE")
         .map(|s| {
@@ -361,7 +393,7 @@ async fn start_amp_bridge(
                 model_prefix: None,
                 requires_reasoning_content: false,
                 actual_model: None,
-                max_tokens_cap: None,
+                max_tokens_cap: limits.output,
                 responses_api_supported: None,
                 is_starter: false,
                 aivo_prefix_models: Vec::new(),
@@ -397,7 +429,10 @@ async fn start_amp_bridge(
                     strip_cache_control: false,
                     model_prefix: None,
                     requires_reasoning_content: false,
-                    max_tokens_cap: None,
+                    // Clamp amp's requested max_tokens (it asks for its
+                    // believed catalog entry's ceiling) to the real model's
+                    // published output limit.
+                    max_tokens_cap: limits.output,
                     is_starter,
                 });
                 let (port, cache, _learned, handle) = translator.start_background().await?;
@@ -422,7 +457,7 @@ async fn start_amp_bridge(
                     model_prefix: None,
                     requires_reasoning_content: false,
                     actual_model: None,
-                    max_tokens_cap: None,
+                    max_tokens_cap: limits.output,
                     responses_api_supported: Some(false),
                     is_starter,
                     aivo_prefix_models: Vec::new(),
@@ -454,8 +489,12 @@ async fn start_amp_bridge(
     });
 
     // Write a merged settings file only when there's something to override.
-    if internal_model.is_some() || !tools_disable.is_empty() {
-        let path = write_amp_settings_override(internal_model.as_ref(), &tools_disable)?;
+    if internal_model.is_some() || default_internal_model.is_some() || !tools_disable.is_empty() {
+        let path = write_amp_settings_override(
+            internal_model.as_ref(),
+            default_internal_model.as_ref(),
+            &tools_disable,
+        )?;
         env.insert(
             "AIVO_AMP_SETTINGS_FILE".to_string(),
             path.to_string_lossy().into_owned(),
@@ -523,6 +562,7 @@ fn sweep_stale_amp_settings_files() {
 /// workspace (trust-filtered) + aivo overrides + managed (corp policy wins).
 fn write_amp_settings_override(
     internal_model: Option<&serde_json::Value>,
+    default_internal_model: Option<&serde_json::Value>,
     tools_disable: &[String],
 ) -> Result<PathBuf> {
     let home = aivo::services::system_env::home_dir().unwrap_or_else(|| PathBuf::from("."));
@@ -537,8 +577,12 @@ fn write_amp_settings_override(
     };
 
     let merged_existing = merge_amp_settings_layers(user_value, workspace_value);
-    let with_aivo_overrides =
-        build_amp_settings_override(merged_existing, internal_model, tools_disable);
+    let with_aivo_overrides = build_amp_settings_override(
+        merged_existing,
+        internal_model,
+        default_internal_model,
+        tools_disable,
+    );
 
     // Managed settings: corporate policy wins over everything.
     let managed_value = find_managed_amp_settings()
@@ -631,9 +675,13 @@ fn merge_amp_settings_layers(
 
 /// Adds aivo's `internal.model` + `tools.disable` (dual-written, prefixed and
 /// bare) plus a small set of set-if-absent bridge-aligned defaults.
+/// `internal_model` (from per-mode flags) always wins; `default_internal_model`
+/// (the believed-window snap) is set-if-absent so a user's own
+/// `internal.model` in settings.json stays authoritative.
 fn build_amp_settings_override(
     existing: Option<serde_json::Value>,
     internal_model: Option<&serde_json::Value>,
+    default_internal_model: Option<&serde_json::Value>,
     tools_disable: &[String],
 ) -> serde_json::Value {
     let mut value = match existing {
@@ -644,7 +692,11 @@ fn build_amp_settings_override(
         return value;
     };
     // amp's binary reads `T["internal.model"]` directly; write both forms.
-    if let Some(model) = internal_model {
+    let user_has_internal_model =
+        obj.contains_key("amp.internal.model") || obj.contains_key("internal.model");
+    let effective_internal_model =
+        internal_model.or_else(|| default_internal_model.filter(|_| !user_has_internal_model));
+    if let Some(model) = effective_internal_model {
         obj.insert("amp.internal.model".to_string(), model.clone());
         obj.insert("internal.model".to_string(), model.clone());
     }
@@ -807,5 +859,46 @@ fn forward_signal(pid: Option<u32>, sig: libc::c_int) {
         unsafe {
             libc::kill(pid as libc::pid_t, sig);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn snap_default_fills_internal_model_when_absent() {
+        let snap = json!({"smart": "anthropic:claude-opus-4-8"});
+        let out = build_amp_settings_override(None, None, Some(&snap), &[]);
+        assert_eq!(out["amp.internal.model"], snap);
+        assert_eq!(out["internal.model"], snap);
+    }
+
+    #[test]
+    fn snap_default_never_clobbers_user_internal_model() {
+        for key in ["amp.internal.model", "internal.model"] {
+            let existing = json!({ key: "openai:my-custom" });
+            let snap = json!({"smart": "anthropic:claude-opus-4-8"});
+            let out = build_amp_settings_override(Some(existing), None, Some(&snap), &[]);
+            assert_eq!(out[key], json!("openai:my-custom"), "{key}");
+            // The untouched spelling must not be introduced with the snap.
+            let other = if key == "internal.model" {
+                "amp.internal.model"
+            } else {
+                "internal.model"
+            };
+            assert!(out.get(other).is_none(), "{other}");
+        }
+    }
+
+    #[test]
+    fn per_mode_flags_win_over_snap_and_user_settings() {
+        let existing = json!({"internal.model": "openai:my-custom"});
+        let forced = json!({"smart": "openai:flagged"});
+        let snap = json!({"smart": "anthropic:claude-opus-4-8"});
+        let out = build_amp_settings_override(Some(existing), Some(&forced), Some(&snap), &[]);
+        assert_eq!(out["amp.internal.model"], forced);
+        assert_eq!(out["internal.model"], forced);
     }
 }

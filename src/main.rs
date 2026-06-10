@@ -11,6 +11,7 @@ mod cli;
 mod commands;
 mod launch;
 mod mode_models;
+mod model_limits;
 mod usage;
 
 use std::path::PathBuf;
