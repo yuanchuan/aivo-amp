@@ -253,7 +253,11 @@ async fn launch_amp(launch: cli::LaunchCli) -> anyhow::Result<i32> {
     .await?;
     let key = match resolution {
         KeyResolution::Selected(k) => k,
-        KeyResolution::Cancelled => return Ok(ExitCode::Success.code()),
+        // Picker cancelled — say so (parity with the host's plugin dispatch).
+        KeyResolution::Cancelled => {
+            eprintln!("{}", style::dim("Cancelled."));
+            return Ok(ExitCode::Success.code());
+        }
         KeyResolution::MissingAuth => {
             eprintln!(
                 "{} No API key available. Add one with {}.",

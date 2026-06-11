@@ -51,8 +51,8 @@ dependencies = [
 
 [[package]]
 name = "aivo"
-version = "0.27.0"
-source = "git+https://github.com/yuanchuan/aivo?tag=v0.27.0#745828df96a65bc7233782034de68930d6e3ae72"
+version = "0.28.0"
+source = "git+https://github.com/yuanchuan/aivo?tag=v0.28.0#29626c4b7503f718bef61b3d6e8b467facb18ec8"
 dependencies = [
  "aes",
  "aes-gcm",

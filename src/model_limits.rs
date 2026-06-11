@@ -4,10 +4,10 @@
 //! `endpoint`-granted plugins two advisory env vars — `AIVO_MODEL_CONTEXT_WINDOW`
 //! and `AIVO_MODEL_MAX_OUTPUT_TOKENS` — so the wrapped CLI doesn't assume a
 //! default window for unknown models. amp is a fat plugin (no `endpoint` cap),
-//! so alongside honoring those vars when a host sets them, it self-resolves the
-//! same cascade the host uses: live models-cache (harvested from the key's
-//! `/v1/models`) → static long-context table. Absent limits mean "unknown" —
-//! amp keeps its own defaults, per the protocol.
+//! so alongside honoring those vars when a host sets them, it self-resolves
+//! through the host's own canonical cascade (`model_metadata::resolve_limits`:
+//! live models-cache → embedded models.dev snapshot). Absent limits mean
+//! "unknown" — amp keeps its own defaults, per the protocol.
 //!
 //! The limits feed two amp-side knobs (see `launch`):
 //! - `output` → `max_tokens_cap` on both bridge translators, clamping amp's
@@ -18,9 +18,9 @@
 //!   catalog entry whose window best matches the real model and pin it via
 //!   `internal.model` — the same trick the bridge docs describe doing by hand.
 
-use aivo::services::context_window::static_context_window;
+use aivo::services::model_metadata::resolve_limits;
 use aivo::services::model_names::strip_context_suffix;
-use aivo::services::models_cache::{ModelsCache, full_catalog_key};
+use aivo::services::models_cache::ModelsCache;
 use aivo::services::session_store::ApiKey;
 
 /// Resolved limits for the model amp is forced to on the wire. `None` fields
@@ -33,9 +33,9 @@ pub struct ModelLimits {
 
 /// Resolves limits for `model` on `key`. Per-field cascade, first hit wins:
 /// host env (`AIVO_MODEL_*`, the protocol handoff — also a manual override
-/// channel) → models-cache metadata under the key's full-catalog then picker
-/// namespace (TTL-free: limits are stable once published) → static
-/// long-context table (context only).
+/// channel) → the host's canonical cascade (`model_metadata::resolve_limits`:
+/// models-cache metadata under the key's full-catalog then picker namespace,
+/// falling back to the embedded models.dev snapshot).
 pub async fn resolve(key: &ApiKey, model: Option<&str>) -> ModelLimits {
     let mut limits = ModelLimits {
         context: env_limit("AIVO_MODEL_CONTEXT_WINDOW"),
@@ -49,56 +49,14 @@ pub async fn resolve(key: &ApiKey, model: Option<&str>) -> ModelLimits {
     }
 
     let cache = ModelsCache::new();
-    let meta = match cache
-        .get_metadata(&full_catalog_key(&key.base_url), model)
-        .await
-    {
-        Some(m) => Some(m),
-        None => cache.get_metadata(&key.base_url, model).await,
-    };
-    if let Some(meta) = meta {
-        limits.context = limits.context.or(meta.context_window);
-        // The cache stores max-output as the `aivo models` display string
-        // ("128K", "1M"); parse it back.
-        limits.output = limits
-            .output
-            .or_else(|| meta.max_output.as_deref().and_then(parse_token_count));
-    }
-    limits.context = limits.context.or_else(|| static_context_window(model));
+    let resolved = resolve_limits(&cache, Some(&key.base_url), model).await;
+    limits.context = limits.context.or(resolved.context);
+    limits.output = limits.output.or(resolved.output);
     limits
 }
 
 fn env_limit(var: &str) -> Option<u64> {
     std::env::var(var).ok()?.trim().parse().ok()
-}
-
-/// Parses a token count in the formats aivo renders/accepts: plain digits
-/// ("131072"), K ("128K" → 128_000), M with one optional decimal ("1M",
-/// "1.5M"). Mirrors the host's `format_token_count` output, so round-tripping
-/// the cache's display string loses at most sub-K precision — and always
-/// rounds down, the safe direction for a cap.
-fn parse_token_count(s: &str) -> Option<u64> {
-    let s = s.trim();
-    if let Ok(n) = s.parse::<u64>() {
-        return Some(n);
-    }
-    let (num, scale) = match s.char_indices().last()? {
-        (i, 'k') | (i, 'K') => (&s[..i], 1_000u64),
-        (i, 'm') | (i, 'M') => (&s[..i], 1_000_000u64),
-        _ => return None,
-    };
-    if let Ok(n) = num.parse::<u64>() {
-        return Some(n * scale);
-    }
-    // "1.5M" form: one fractional digit, M only (format_token_count never
-    // emits fractional K).
-    let (whole, frac) = num.split_once('.')?;
-    if scale != 1_000_000 || frac.len() != 1 {
-        return None;
-    }
-    let whole: u64 = whole.parse().ok()?;
-    let frac: u64 = frac.parse().ok()?;
-    Some(whole * scale + frac * 100_000)
 }
 
 /// Picks the amp catalog entry whose believed window best matches the real
@@ -133,20 +91,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_token_count_reads_plain_k_and_m_forms() {
-        assert_eq!(parse_token_count("131072"), Some(131_072));
-        assert_eq!(parse_token_count("128K"), Some(128_000));
-        assert_eq!(parse_token_count("200k"), Some(200_000));
-        assert_eq!(parse_token_count("1M"), Some(1_000_000));
-        assert_eq!(parse_token_count("1.5M"), Some(1_500_000));
-        assert_eq!(parse_token_count(" 64K "), Some(64_000));
-    }
-
-    #[test]
-    fn parse_token_count_rejects_garbage() {
-        for s in ["", "K", "1.5K", "1.55M", "12B", "abc", "-1"] {
-            assert_eq!(parse_token_count(s), None, "{s:?}");
-        }
+    fn known_model_resolves_from_embedded_snapshot() {
+        // The snapshot leg of the host cascade — no cache file, no env, no
+        // network. Pins that the resolve_limits port still yields real limits.
+        let key = ApiKey::new_with_protocol(
+            "id".into(),
+            "n".into(),
+            "https://api.example.com/v1".into(),
+            None,
+            "secret".into(),
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let limits = rt.block_on(resolve(&key, Some("claude-sonnet-4-6")));
+        assert_eq!(limits.context, Some(1_000_000));
+        assert_eq!(limits.output, Some(64_000));
+        // Unknown model → unknown limits, not zeros.
+        let unknown = rt.block_on(resolve(&key, Some("no-such-model-xyz")));
+        assert_eq!(unknown, ModelLimits::default());
     }
 
     #[test]
