@@ -26,12 +26,14 @@ too_many_lines = "allow"
 
 [dependencies]
 # The aivo lib: reuse its key store, routers, http/provider utils, constants.
-# Pinned to the public v0.28.0 tag so the plugin builds standalone — what
+# Pinned to the public v0.29.0 tag so the plugin builds standalone — what
 # `aivo plugins install github:yuanchuan/aivo-amp`, CI, and release.yml compile.
+# v0.29.0 is the enc5 floor: its decrypt path reads keyring-custody (enc5)
+# stores written by hosts that enable OS-keyring custody by default.
 # The usage-accounting helpers the bridge needs are vendored in src/usage.rs, so
 # no unreleased aivo API is required. Local aivo co-dev: swap to the path line
 # (exactly one must be active).
-aivo = { git = "https://github.com/yuanchuan/aivo", tag = "v0.28.0" }
+aivo = { git = "https://github.com/yuanchuan/aivo", tag = "v0.29.0" }
 # aivo = { path = "../aivo" }
 
 # CLI
