@@ -14,11 +14,15 @@ use aivo::constants::{
 use aivo::services::claude_oauth::CLAUDE_OAUTH_SENTINEL;
 use aivo::services::codex_oauth::CODEX_OAUTH_SENTINEL;
 use aivo::services::copilot_auth::CopilotTokenManager;
+use aivo::services::cursor_acp;
+use aivo::services::cursor_bridge::{CursorModelRouter, CursorRouterConfig};
 use aivo::services::gemini_oauth::GEMINI_OAUTH_SENTINEL;
+use aivo::services::models_cache::ModelsCache;
 use aivo::services::provider_profile::provider_profile_for_key;
 use aivo::services::provider_protocol::{ProviderProtocol, detect_provider_protocol};
 use aivo::services::route_cache::{PersistedRoute, RouteCache};
 use aivo::services::session_store::{ApiKey, SessionStore};
+use aivo::services::system_env;
 use aivo::services::{
     AnthropicToOpenAIRouter, AnthropicToOpenAIRouterConfig, CopilotRouter, CopilotRouterConfig,
     ResponsesToChatRouter, ResponsesToChatRouterConfig,
@@ -49,10 +53,22 @@ pub async fn run_amp(
 ) -> Result<i32> {
     let mut env = for_amp(key, model, modes);
 
-    if env.contains_key("AIVO_USE_CURSOR_ROUTER") {
-        anyhow::bail!(
-            "amp over cursor-agent (ACP) keys isn't supported by the aivo-amp plugin yet — pick a key with a real base URL, or `copilot`/`ollama`"
+    // Cursor ACP keys: serve aivo's Cursor ACP router as a loopback `/v1`
+    // upstream so the bridge treats it like any OpenAI-protocol key.
+    if env.remove("AIVO_USE_CURSOR_ROUTER").is_some() {
+        // Read the secret from `key`; don't leak it into the amp child's env.
+        env.remove("AIVO_CURSOR_KEY_SECRET");
+        let (port, token, handle) = start_cursor_upstream(key).await?;
+        env.insert(
+            "AIVO_AMP_UPSTREAM_BASE_URL".to_string(),
+            format!("http://127.0.0.1:{port}/v1"),
         );
+        env.insert("AIVO_AMP_UPSTREAM_KEY".to_string(), token);
+        tokio::spawn(async move {
+            if let Ok(Err(e)) = handle.await {
+                eprintln!("aivo: amp-bridge cursor router exited: {e}");
+            }
+        });
     }
 
     // Sub-router caches captured for post-session persistence, each tagged with
@@ -152,6 +168,40 @@ async fn persist_amp_routes(
     }
 }
 
+/// Serves aivo's bearer-gated Cursor ACP router and returns its loopback port,
+/// the bearer token, and its background handle. Mirrors aivo's
+/// `plugin::endpoint::start_cursor_endpoint` (whose token helper is crate-private).
+async fn start_cursor_upstream(
+    key: &ApiKey,
+) -> Result<(u16, String, tokio::task::JoinHandle<Result<()>>)> {
+    cursor_acp::ensure_cursor_agent_installed()?;
+    if cursor_acp::is_legacy_cursor_login_secret(key.key.as_str()) {
+        anyhow::bail!(
+            "This cursor key predates per-account isolation. Run `aivo keys rm {0}` then `aivo keys add cursor` to recreate it as an isolated account.",
+            key.id
+        );
+    }
+    if cursor_acp::cursor_oauth_shadow_signed_out(key).await {
+        anyhow::bail!(
+            "Cursor is not logged in for this key. Run `aivo keys reauth {0}` to sign in again.",
+            key.id
+        );
+    }
+
+    let token = format!("aivo-cursor-{:032x}", rand::random::<u128>());
+    let workspace_cwd = system_env::current_dir_string().unwrap_or_else(|| ".".to_string());
+    let router = CursorModelRouter::new(CursorRouterConfig {
+        key: key.clone(),
+        workspace_cwd,
+        models_cache: Some(ModelsCache::new()),
+        prewarm_count: 0,
+        mcp_prewarm_id_style: None,
+        expected_token: Some(token.clone()),
+    });
+    let (port, handle) = router.start_background().await?;
+    Ok((port, token, handle))
+}
+
 /// Builds the amp-specific environment for `key`. Ported from
 /// `environment_injector::for_amp`. Produces the `AIVO_AMP_*` scaffolding that
 /// `start_amp_bridge` consumes, or `AMP_URL`/`AMP_API_KEY` directly for a
@@ -161,8 +211,8 @@ pub fn for_amp(
     model: Option<&str>,
     amp_modes: &AmpModeModels,
 ) -> HashMap<String, String> {
-    // Cursor ACP path: chain amp → amp_bridge → cursor router. (run_amp bails
-    // before launch since the cursor router isn't wired into the plugin yet.)
+    // Cursor ACP path: `run_amp` overwrites the placeholder upstream below with
+    // the real Cursor ACP router's loopback port + token before bridging.
     if key.is_cursor_acp() {
         let mut env = HashMap::new();
         env.insert("AIVO_USE_CURSOR_ROUTER".to_string(), "1".to_string());
