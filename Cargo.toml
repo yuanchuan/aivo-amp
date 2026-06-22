@@ -1,6 +1,6 @@
 [package]
 name = "aivo-amp"
-version = "0.1.7"
+version = "0.1.8"
 # MSRV: 1.95 — the floor the pinned `aivo` dep declares (`rust-version =
 # "1.95"`), so it's the effective floor for the whole build. Edition 2024 needs
 # 1.85; CI's `msrv` job builds on 1.95.0 to guard this.

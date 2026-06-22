@@ -91,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "aivo-amp"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "aivo",
  "anyhow",
