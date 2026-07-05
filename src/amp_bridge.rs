@@ -516,10 +516,22 @@ async fn handle_websocket(
                 break;
             }
             Message::Ping(p) => {
-                log_ws_event(trace, full_path, "recv-ping", &format!("<{} bytes>", p.len())).await;
+                log_ws_event(
+                    trace,
+                    full_path,
+                    "recv-ping",
+                    &format!("<{} bytes>", p.len()),
+                )
+                .await;
             }
             Message::Pong(p) => {
-                log_ws_event(trace, full_path, "recv-pong", &format!("<{} bytes>", p.len())).await;
+                log_ws_event(
+                    trace,
+                    full_path,
+                    "recv-pong",
+                    &format!("<{} bytes>", p.len()),
+                )
+                .await;
             }
             _ => {}
         }
@@ -4755,7 +4767,9 @@ mod tests {
         let state = fake_bridge_state();
         let full_path = "/api/user-actor-credentials";
         let req = format!("POST {full_path} HTTP/1.1\r\n\r\n");
-        let resp = dispatch(&state, &req, "POST", full_path, "{}").await.unwrap();
+        let resp = dispatch(&state, &req, "POST", full_path, "{}")
+            .await
+            .unwrap();
         let BridgeResponse::Buffered { status, body, .. } = resp else {
             panic!("expected buffered response");
         };
