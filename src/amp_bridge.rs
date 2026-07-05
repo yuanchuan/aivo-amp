@@ -508,9 +508,18 @@ async fn handle_websocket(
                 )
                 .await;
             }
-            Message::Close(_) => {
-                log_ws_event(trace, full_path, "close", "").await;
+            Message::Close(frame) => {
+                let detail = frame
+                    .map(|f| format!("code={} reason={}", f.code, f.reason))
+                    .unwrap_or_else(|| "<no frame>".to_string());
+                log_ws_event(trace, full_path, "close", &detail).await;
                 break;
+            }
+            Message::Ping(p) => {
+                log_ws_event(trace, full_path, "recv-ping", &format!("<{} bytes>", p.len())).await;
+            }
+            Message::Pong(p) => {
+                log_ws_event(trace, full_path, "recv-pong", &format!("<{} bytes>", p.len())).await;
             }
             _ => {}
         }
@@ -3280,6 +3289,18 @@ async fn dispatch(
         return Ok(stub_buffered(body_text, CONTENT_TYPE_JSON));
     }
 
+    // amp's per-user actor fetches its Rivet WS creds here; the parser
+    // throws + retry-loops (wedging the UI on "Loading thread") unless
+    // all three fields are present and non-empty. Must precede the
+    // `/api/user` catch-all, which this path starts_with.
+    if path == "/api/user-actor-credentials" {
+        return Ok(stub_buffered(
+            r#"{"userId":"user_aivo_local","wsToken":"aivo-bridge","poolName":"default"}"#
+                .to_string(),
+            CONTENT_TYPE_JSON,
+        ));
+    }
+
     if path.starts_with("/api/user") {
         return Ok(stub_buffered(
             r#"{"userEmail":"aivo@local","isInternalUser":false,"features":[],"team":null,"mysteriousMessage":""}"#.to_string(),
@@ -4724,6 +4745,29 @@ mod tests {
         assert_eq!(threads.len(), 1);
         assert_eq!(threads[0]["id"], "T-019e05ae-80a5-7718-80ee-ec89cb6fc1c0");
         assert_eq!(v["hasMore"], false);
+    }
+
+    /// `/api/user-actor-credentials` must win over the `/api/user`
+    /// catch-all and return non-empty userId/wsToken/poolName, else amp
+    /// retry-loops on "Loading thread".
+    #[tokio::test]
+    async fn dispatch_serves_user_actor_credentials_shape() {
+        let state = fake_bridge_state();
+        let full_path = "/api/user-actor-credentials";
+        let req = format!("POST {full_path} HTTP/1.1\r\n\r\n");
+        let resp = dispatch(&state, &req, "POST", full_path, "{}").await.unwrap();
+        let BridgeResponse::Buffered { status, body, .. } = resp else {
+            panic!("expected buffered response");
+        };
+        assert_eq!(status, 200);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["userId"], "user_aivo_local");
+        assert_eq!(v["wsToken"], "aivo-bridge");
+        assert!(
+            v["poolName"].as_str().is_some_and(|s| !s.is_empty()),
+            "poolName must be a non-empty string, got {v:?}"
+        );
+        assert!(v.get("userEmail").is_none(), "misrouted to /api/user stub");
     }
 
     /// A find query matching nothing must still return a well-formed
