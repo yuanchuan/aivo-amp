@@ -54,17 +54,17 @@ pub struct LaunchCli {
     #[arg(long = "mode", num_args = 0..=1, default_missing_value = "", value_name = "MODE")]
     pub mode: Option<String>,
 
-    /// Per-mode model override for `rush`.
-    #[arg(long = "rush-model", value_name = "MODEL")]
+    /// Per-mode model override for `rush` (`[key::]model`; bare flag or `key::` opens pickers).
+    #[arg(long = "rush-model", num_args = 0..=1, default_missing_value = "", value_name = "MODEL")]
     pub rush_model: Option<String>,
-    /// Per-mode model override for `smart`.
-    #[arg(long = "smart-model", value_name = "MODEL")]
+    /// Per-mode model override for `smart` (`[key::]model`; bare flag or `key::` opens pickers).
+    #[arg(long = "smart-model", num_args = 0..=1, default_missing_value = "", value_name = "MODEL")]
     pub smart_model: Option<String>,
-    /// Per-mode model override for `deep`.
-    #[arg(long = "deep-model", value_name = "MODEL")]
+    /// Per-mode model override for `deep` (`[key::]model`; bare flag or `key::` opens pickers).
+    #[arg(long = "deep-model", num_args = 0..=1, default_missing_value = "", value_name = "MODEL")]
     pub deep_model: Option<String>,
-    /// Per-mode model override for `large`.
-    #[arg(long = "large-model", value_name = "MODEL")]
+    /// Per-mode model override for `large` (`[key::]model`; bare flag or `key::` opens pickers).
+    #[arg(long = "large-model", num_args = 0..=1, default_missing_value = "", value_name = "MODEL")]
     pub large_model: Option<String>,
 
     /// Strip a tool from amp's request to the upstream (repeatable).
@@ -130,5 +130,22 @@ mod tests {
     fn no_mode_flag_is_none() {
         let cli = LaunchCli::try_parse_from(["aivo-amp"]).unwrap();
         assert_eq!(cli.mode, None);
+    }
+
+    /// Bare per-mode model flags parse to `Some("")` — the sentinel
+    /// `launch_amp` turns into a model picker (mirrors bare `-k`/`-m`/`--mode`).
+    #[test]
+    fn bare_mode_model_flags_parse_as_empty() {
+        let cli = LaunchCli::try_parse_from(["aivo-amp", "--rush-model", "--deep-model"]).unwrap();
+        assert_eq!(cli.rush_model.as_deref(), Some(""));
+        assert_eq!(cli.deep_model.as_deref(), Some(""));
+        assert_eq!(cli.smart_model, None);
+    }
+
+    #[test]
+    fn explicit_mode_model_value_parses() {
+        let cli =
+            LaunchCli::try_parse_from(["aivo-amp", "--smart-model", "deepseek-chat"]).unwrap();
+        assert_eq!(cli.smart_model.as_deref(), Some("deepseek-chat"));
     }
 }

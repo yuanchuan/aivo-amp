@@ -17,10 +17,12 @@ use aivo::services::cursor_acp;
 use aivo::services::cursor_bridge::{CursorModelRouter, CursorRouterConfig};
 use aivo::services::gemini_oauth::GEMINI_OAUTH_SENTINEL;
 use aivo::services::models_cache::ModelsCache;
-use aivo::services::provider_profile::provider_profile_for_key;
+use aivo::services::provider_profile::{ProviderKind, provider_profile_for_key};
 use aivo::services::provider_protocol::{ProviderProtocol, detect_provider_protocol};
 use aivo::services::route_cache::{PersistedRoute, RouteCache};
-use aivo::services::serve_router::start_provider_oauth_loopback_router;
+use aivo::services::serve_router::{
+    start_provider_oauth_loopback_router, start_tier_loopback_router,
+};
 use aivo::services::session_store::{ApiKey, SessionStore};
 use aivo::services::system_env;
 use aivo::services::{
@@ -49,9 +51,55 @@ pub async fn run_amp(
     key: &ApiKey,
     model: Option<&str>,
     modes: &AmpModeModels,
+    tier_upstreams: &[(String, String)],
     amp_args: &[String],
 ) -> Result<i32> {
     let mut env = for_amp(key, model, modes);
+
+    // Per-mode keys: front the translators with a bearer-gated multi-upstream
+    // loopback ServeRouter — base = main key, each tier model dispatched to
+    // its own key. The router owns provider dispatch (OAuth refresh included),
+    // so the cursor and provider-OAuth special paths below only run tier-less.
+    if !tier_upstreams.is_empty() {
+        if key.is_cursor_acp() {
+            anyhow::bail!(
+                "per-mode provider routing isn't supported with a cursor main key — use an API-key provider as the main (-k)"
+            );
+        }
+        if is_amp_native_endpoint(&key.base_url) {
+            anyhow::bail!(
+                "per-mode provider routing needs the aivo bridge — an amp-native endpoint key talks to amp's own backend"
+            );
+        }
+        if provider_profile_for_key(key).kind == ProviderKind::Ollama {
+            anyhow::bail!(
+                "per-mode provider routing isn't supported with an Ollama main key — use an API-key provider as the main (-k)"
+            );
+        }
+        // Same keys `start_amp_bridge` bails on; bail here because the
+        // loopback overwrite below would otherwise mask the sentinel.
+        if matches!(
+            key.base_url.as_str(),
+            CLAUDE_OAUTH_SENTINEL | GEMINI_OAUTH_SENTINEL
+        ) {
+            anyhow::bail!(
+                "amp doesn't yet support `{}` keys — pick a key with a real base URL, or `copilot`/`ollama`",
+                key.base_url
+            );
+        }
+        let token = format!("aivo-tier-{:032x}", rand::random::<u128>());
+        let port =
+            start_tier_loopback_router(key.clone(), tier_upstreams, Some(token.clone()), store)
+                .await?;
+        env.insert(
+            "AIVO_AMP_UPSTREAM_BASE_URL".to_string(),
+            format!("http://127.0.0.1:{port}/v1"),
+        );
+        env.insert("AIVO_AMP_UPSTREAM_KEY".to_string(), token);
+        // The loopback owns starter specifics; translators see a plain
+        // OpenAI upstream.
+        env.remove("AIVO_AMP_IS_STARTER");
+    }
 
     // Cursor ACP keys: serve aivo's Cursor ACP router as a loopback `/v1`
     // upstream so the bridge treats it like any OpenAI-protocol key.
@@ -74,8 +122,11 @@ pub async fn run_amp(
     // Provider-OAuth keys (Codex/Kimi/Grok): chain to a bearer-gated loopback
     // ServeRouter that owns token refresh — the translators need an ordinary
     // static-key upstream. Claude/Gemini OAuth still bail in `start_amp_bridge`:
-    // their upstreams lack the surfaces amp needs.
-    if key.is_codex_oauth() || key.is_kimi_oauth() || key.is_grok_oauth() {
+    // their upstreams lack the surfaces amp needs. Under per-mode routing the
+    // tier router above already fronts the OAuth main.
+    if tier_upstreams.is_empty()
+        && (key.is_codex_oauth() || key.is_kimi_oauth() || key.is_grok_oauth())
+    {
         let token = format!("aivo-oauth-{:032x}", rand::random::<u128>());
         let port = start_provider_oauth_loopback_router(
             key.key.as_str(),

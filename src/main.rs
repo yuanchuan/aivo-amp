@@ -268,6 +268,11 @@ async fn launch_amp(launch: cli::LaunchCli) -> anyhow::Result<i32> {
         }
     };
 
+    let Some(tier_upstreams) = resolve_mode_model_overrides(&store, &key, &mut modes).await? else {
+        eprintln!("{}", style::dim("Cancelled."));
+        return Ok(ExitCode::Success.code());
+    };
+
     // For a `type: "coding-agent"` plugin the host owns `-m`/`--model`: it strips
     // the flag from our argv (so it never reaches our CLI) and instead *persists*
     // the resolved model on the key (`set_code_model`) before launching us — the
@@ -287,7 +292,141 @@ async fn launch_amp(launch: cli::LaunchCli) -> anyhow::Result<i32> {
             .filter(|m| !m.trim().is_empty()),
     };
     let model = model_owned.as_deref();
-    launch::run_amp(&store, &key, model, &modes, &launch.amp_args).await
+    launch::run_amp(
+        &store,
+        &key,
+        model,
+        &modes,
+        &tier_upstreams,
+        &launch.amp_args,
+    )
+    .await
+}
+
+/// Resolves the four per-mode model slots (host `--opus-model` grammar):
+/// `key::model` pins a provider, `key::` opens that key's model picker, a bare
+/// flag opens key + model pickers; aliases may expand to `key::model`. An
+/// unfetchable/empty catalog or a non-interactive terminal drops the override
+/// (amp keeps its default). Off-main-key modes come back as `(model, key_id)`
+/// tiers; `None` means a picker was cancelled — the caller must not launch.
+async fn resolve_mode_model_overrides(
+    store: &SessionStore,
+    main_key: &aivo::services::session_store::ApiKey,
+    modes: &mut mode_models::AmpModeModels,
+) -> anyhow::Result<Option<Vec<(String, String)>>> {
+    use aivo::commands::models::ModelOutcome;
+
+    if [&modes.rush, &modes.smart, &modes.deep, &modes.large]
+        .into_iter()
+        .all(|s| s.is_none())
+    {
+        return Ok(Some(Vec::new()));
+    }
+
+    let aliases = store.get_aliases().await.unwrap_or_default();
+    let all_keys = store.get_keys().await.unwrap_or_default();
+    let client = aivo::services::http_utils::router_http_client();
+    let cache = aivo::services::models_cache::ModelsCache::new();
+
+    let mut tiers: Vec<(String, String)> = Vec::new();
+    // (suffix-stripped model → key id): the router dispatches by model name,
+    // so one name must resolve to one key (same name + same key dedupes).
+    let mut routed: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+    for (mode, slot) in [
+        ("rush", &mut modes.rush),
+        ("smart", &mut modes.smart),
+        ("deep", &mut modes.deep),
+        ("large", &mut modes.large),
+    ] {
+        let Some(raw) = slot.clone() else { continue };
+        let (key_ref, model_part) = aivo::cli_args::split_tier_spec(&raw);
+        let (key_ref, model_part) =
+            aivo::cli_args::resolve_alias_with_tier(&aliases, key_ref, model_part);
+
+        let tier_key = if let Some(kr) = key_ref {
+            match store.resolve_key_by_id_or_name(&kr).await {
+                Ok(k) => k,
+                Err(e) => anyhow::bail!("--{mode}-model key '{kr}': {e}"),
+            }
+        } else if model_part.is_empty() {
+            let annotations = vec![None; all_keys.len()];
+            let prompt = format!(
+                "Select provider for {} {}",
+                style::cyan(mode),
+                style::bold("model")
+            );
+            match aivo::commands::keys::prompt_pick_key_without_activation(
+                &all_keys,
+                &annotations,
+                &prompt,
+                0,
+            )? {
+                Some(k) => k,
+                None => return Ok(None),
+            }
+        } else {
+            main_key.clone()
+        };
+
+        let model_empty = model_part.is_empty();
+        let prompt = if model_empty {
+            format!(
+                "Select {} {} ({})",
+                style::cyan(mode),
+                style::bold("model"),
+                tier_key.display_name()
+            )
+        } else {
+            String::new()
+        };
+        // `tool: None`: no "(leave it to the tool)" row — skipping a mode is
+        // spelled by not passing its flag, and Esc cancels the launch.
+        let outcome = aivo::commands::models::resolve_model_outcome(
+            &client,
+            &tier_key,
+            Some(model_part),
+            true,
+            false,
+            None,
+            &cache,
+            &prompt,
+        )
+        .await?;
+        let mut model = match outcome {
+            ModelOutcome::Model(m) => m,
+            ModelOutcome::UseDefault => {
+                *slot = None;
+                continue;
+            }
+            ModelOutcome::Cancelled => return Ok(None),
+        };
+        // Canonicalize so the settings override and the router's dispatch key match.
+        if tier_key.is_claude_oauth() {
+            model = aivo::services::model_names::anthropic_native_model_name(&model);
+        }
+
+        let name = aivo::services::model_names::strip_context_suffix(&model).to_string();
+        if let Some(existing) = routed.get(&name)
+            && *existing != tier_key.id
+        {
+            anyhow::bail!(
+                "per-mode routing needs a distinct model name per provider; '{name}' would route to two different keys"
+            );
+        }
+        routed.insert(name, tier_key.id.clone());
+
+        *slot = Some(model.clone());
+        if tier_key.id != main_key.id {
+            eprintln!(
+                "  {} {mode} → {model} ({})",
+                style::dim("›"),
+                tier_key.display_name()
+            );
+            tiers.push((model, tier_key.id));
+        }
+    }
+    Ok(Some(tiers))
 }
 
 /// Interactive picker for bare `--mode`. Lists amp's agent modes with their
