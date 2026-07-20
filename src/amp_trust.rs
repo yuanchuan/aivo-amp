@@ -58,10 +58,7 @@ pub fn find_workspace_amp_settings(start: &Path, home: Option<&Path>) -> Option<
         {
             return None;
         }
-        match current.parent() {
-            Some(p) => current = p,
-            None => return None,
-        }
+        current = current.parent()?;
     }
 }
 

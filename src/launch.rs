@@ -12,7 +12,6 @@ use aivo::constants::{
     AIVO_STARTER_MODEL, AIVO_STARTER_REAL_URL, AIVO_STARTER_SENTINEL, PLACEHOLDER_LOOPBACK_URL,
 };
 use aivo::services::claude_oauth::CLAUDE_OAUTH_SENTINEL;
-use aivo::services::codex_oauth::CODEX_OAUTH_SENTINEL;
 use aivo::services::copilot_auth::CopilotTokenManager;
 use aivo::services::cursor_acp;
 use aivo::services::cursor_bridge::{CursorModelRouter, CursorRouterConfig};
@@ -21,6 +20,7 @@ use aivo::services::models_cache::ModelsCache;
 use aivo::services::provider_profile::provider_profile_for_key;
 use aivo::services::provider_protocol::{ProviderProtocol, detect_provider_protocol};
 use aivo::services::route_cache::{PersistedRoute, RouteCache};
+use aivo::services::serve_router::start_provider_oauth_loopback_router;
 use aivo::services::session_store::{ApiKey, SessionStore};
 use aivo::services::system_env;
 use aivo::services::{
@@ -69,6 +69,31 @@ pub async fn run_amp(
                 eprintln!("aivo: amp-bridge cursor router exited: {e}");
             }
         });
+    }
+
+    // Provider-OAuth keys (Codex/Kimi/Grok): chain to a bearer-gated loopback
+    // ServeRouter that owns token refresh — the translators need an ordinary
+    // static-key upstream. Claude/Gemini OAuth still bail in `start_amp_bridge`:
+    // their upstreams lack the surfaces amp needs.
+    if key.is_codex_oauth() || key.is_kimi_oauth() || key.is_grok_oauth() {
+        let token = format!("aivo-oauth-{:032x}", rand::random::<u128>());
+        let port = start_provider_oauth_loopback_router(
+            key.key.as_str(),
+            Some(token.clone()),
+            store,
+        )
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "OAuth credential for key '{}' is unreadable — re-add it with `aivo keys add`",
+                key.display_name()
+            )
+        })?;
+        env.insert(
+            "AIVO_AMP_UPSTREAM_BASE_URL".to_string(),
+            format!("http://127.0.0.1:{port}/v1"),
+        );
+        env.insert("AIVO_AMP_UPSTREAM_KEY".to_string(), token);
     }
 
     // Sub-router caches captured for post-session persistence, each tagged with
@@ -356,11 +381,11 @@ async fn start_amp_bridge(
         .remove("AIVO_AMP_UPSTREAM_KEY")
         .ok_or_else(|| anyhow::anyhow!("Missing AIVO_AMP_UPSTREAM_KEY"))?;
 
-    // OAuth sentinels need credential refreshers the bridge translators don't
-    // wire up yet — bail loudly before spawning.
+    // Claude/Gemini OAuth upstreams lack the wire surfaces amp needs — bail
+    // before spawning. Provider-OAuth keys were rerouted in `run_amp`.
     if matches!(
         upstream_base_url.as_str(),
-        CLAUDE_OAUTH_SENTINEL | CODEX_OAUTH_SENTINEL | GEMINI_OAUTH_SENTINEL
+        CLAUDE_OAUTH_SENTINEL | GEMINI_OAUTH_SENTINEL
     ) {
         anyhow::bail!(
             "amp doesn't yet support `{upstream_base_url}` keys — pick a key with a real base URL, or `copilot`/`ollama`"

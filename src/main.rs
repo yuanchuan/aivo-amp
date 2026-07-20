@@ -270,7 +270,7 @@ async fn launch_amp(launch: cli::LaunchCli) -> anyhow::Result<i32> {
 
     // For a `type: "coding-agent"` plugin the host owns `-m`/`--model`: it strips
     // the flag from our argv (so it never reaches our CLI) and instead *persists*
-    // the resolved model on the key (`set_chat_model`) before launching us — the
+    // the resolved model on the key (`set_code_model`) before launching us — the
     // same way it persists the `-k` choice as the last selection. So when the
     // flag didn't arrive, recover it from the store for the key we just resolved,
     // mirroring how `key` itself came back via the persisted last-selection. A
@@ -280,7 +280,7 @@ async fn launch_amp(launch: cli::LaunchCli) -> anyhow::Result<i32> {
     let model_owned = match launch.model.clone().filter(|m| !m.trim().is_empty()) {
         Some(m) => Some(m),
         None => store
-            .get_chat_model(&key.id)
+            .get_code_model(&key.id)
             .await
             .ok()
             .flatten()

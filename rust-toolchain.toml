@@ -1,8 +1,5 @@
-# Pin the toolchain channel + components so every contributor (and CI) runs
-# the same fmt/clippy. Uses latest stable rather than an exact version: the
-# crate targets 1.95 as its MSRV (see Cargo.toml) but builds on current
-# stable. Pin to an exact version like "1.95.0" if you need byte-reproducible
-# builds.
+# Exact pin so contributors + CI share one compiler/fmt/clippy. Must stay ≥ the
+# `aivo` dep's declared MSRV — mirror aivo's own pin when bumping the dep.
 [toolchain]
-channel = "stable"
+channel = "1.97.0"
 components = ["rustfmt", "clippy"]

@@ -1,11 +1,11 @@
 [package]
 name = "aivo-amp"
 version = "0.1.9"
-# MSRV: 1.95 — the floor the pinned `aivo` dep declares (`rust-version =
-# "1.95"`), so it's the effective floor for the whole build. Edition 2024 needs
-# 1.85; CI's `msrv` job builds on 1.95.0 to guard this.
+# MSRV: 1.97 — the floor the pinned `aivo` dep declares (`rust-version =
+# "1.97"`), so it's the effective floor for the whole build. Edition 2024 needs
+# 1.85; CI's `msrv` job builds on 1.97.0 to guard this.
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.97"
 authors = ["yuanchuan"]
 description = "Sourcegraph Amp support for aivo, as a sibling-binary plugin (aivo amp …)"
 license = "MIT"
@@ -33,8 +33,10 @@ too_many_lines = "allow"
 # The usage-accounting helpers the bridge needs are vendored in src/usage.rs, so
 # no unreleased aivo API is required. Local aivo co-dev: swap to the path line
 # (exactly one must be active).
-aivo = { git = "https://github.com/yuanchuan/aivo", tag = "v0.29.0" }
-# aivo = { path = "../aivo" }
+# TODO(release): repin to the first aivo tag (> v0.41.3) that exports
+# `start_provider_oauth_loopback_router` before committing — path dep is co-dev only.
+# aivo = { git = "https://github.com/yuanchuan/aivo", tag = "v0.29.0" }
+aivo = { path = "../aivo" }
 
 # CLI
 clap = { version = "4.5", features = ["derive"] }
