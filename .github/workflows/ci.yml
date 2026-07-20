@@ -39,19 +39,20 @@ jobs:
         run: cargo test --all-targets --locked
 
   msrv:
-    name: build on MSRV (1.95)
+    name: build on MSRV (1.97)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # Keep this version in sync with `rust-version` in Cargo.toml.
+      # Keep this version in sync with `rust-version` in Cargo.toml — which the
+      # pinned `aivo` dep raises to 1.97, enforced by `--locked` at resolve time.
       - name: Install MSRV toolchain
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@1.97.0
 
       - name: Cache cargo + target
         uses: Swatinem/rust-cache@v2
 
-      # `+1.95.0` overrides rust-toolchain.toml (which pins stable) so this
+      # `+1.97.0` overrides rust-toolchain.toml (which pins stable) so this
       # job actually exercises the declared MSRV.
       - name: Build
-        run: cargo +1.95.0 build --locked
+        run: cargo +1.97.0 build --locked
