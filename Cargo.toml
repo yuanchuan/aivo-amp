@@ -26,17 +26,16 @@ too_many_lines = "allow"
 
 [dependencies]
 # The aivo lib: reuse its key store, routers, http/provider utils, constants.
-# Pinned to the public v0.29.0 tag so the plugin builds standalone — what
+# Pinned to the public v0.41.4 tag so the plugin builds standalone — what
 # `aivo plugins install github:yuanchuan/aivo-amp`, CI, and release.yml compile.
-# v0.29.0 is the enc5 floor: its decrypt path reads keyring-custody (enc5)
-# stores written by hosts that enable OS-keyring custody by default.
-# The usage-accounting helpers the bridge needs are vendored in src/usage.rs, so
-# no unreleased aivo API is required. Local aivo co-dev: swap to the path line
-# (exactly one must be active).
-# TODO(release): repin to the first aivo tag (> v0.41.3) that exports
-# `start_provider_oauth_loopback_router` before committing — path dep is co-dev only.
-# aivo = { git = "https://github.com/yuanchuan/aivo", tag = "v0.29.0" }
-aivo = { path = "../aivo" }
+# v0.41.4 is the first tag that exports `start_provider_oauth_loopback_router`
+# and `start_tier_loopback_router` (src/launch.rs), the loopback ServeRouters the
+# bridge needs for OAuth token-refresh and per-mode provider routing. It's well
+# past the v0.29.0 enc5 floor, so its decrypt path still reads keyring-custody
+# (enc5) stores. The usage-accounting helpers the bridge needs are vendored in
+# src/usage.rs, so no unreleased aivo API is required. Local aivo co-dev: swap to
+# the path line (exactly one must be active).
+aivo = { git = "https://github.com/yuanchuan/aivo", tag = "v0.41.4" }
 
 # CLI
 clap = { version = "4.5", features = ["derive"] }
