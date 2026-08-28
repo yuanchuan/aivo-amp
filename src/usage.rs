@@ -138,6 +138,18 @@ impl StreamUsageSniffer {
         }
     }
 
+    pub(crate) fn observe_json_body(&mut self, body: &str) {
+        if !self.enabled {
+            return;
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(body.trim())
+            && let Some(u) = extract_usage_from_value(&v)
+        {
+            self.usage.merge_max(&u);
+            self.seen = true;
+        }
+    }
+
     pub(crate) fn finish(self) -> Option<TokenUsage> {
         (self.enabled && self.seen).then_some(self.usage)
     }

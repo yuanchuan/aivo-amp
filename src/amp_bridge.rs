@@ -2819,6 +2819,7 @@ async fn stream_anthropic_sse(
     // We sit on "working" until the first delta is about to fire,
     // then promote — that way the status badge tracks reality.
     let mut emitted_streaming_state = false;
+    let mut stream_error: Option<String> = None;
 
     'outer: while let Some(chunk_res) = byte_stream.next().await {
         if cancel_flag.load(Ordering::Relaxed) {
@@ -2849,6 +2850,16 @@ async fn stream_anthropic_sse(
 
             match ev.get("type").and_then(|t| t.as_str()).unwrap_or("") {
                 "message_stop" => break 'outer,
+                "error" => {
+                    stream_error = Some(
+                        ev.get("error")
+                            .and_then(|e| e.get("message"))
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("unknown upstream stream error")
+                            .to_string(),
+                    );
+                    break 'outer;
+                }
                 "content_block_start" => {
                     let idx = ev.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                     let mut block = ev.get("content_block").cloned().unwrap_or(json!({}));
@@ -3021,6 +3032,25 @@ async fn stream_anthropic_sse(
         }
     }
     let cancelled = cancel_flag.load(Ordering::Relaxed);
+
+    if !cancelled
+        && blocks.is_empty()
+        && let Some(salvaged) = parse_buffered_message_blocks(&sse_buf)
+    {
+        sniffer.observe_json_body(&sse_buf);
+        blocks = salvaged;
+        emit_buffered_blocks_progressively(
+            write_tx,
+            trace,
+            full_path,
+            assistant_message_id,
+            &blocks,
+            cancel_flag,
+        )
+        .await;
+        return Ok(blocks);
+    }
+
     // Terminal delta has no blocks — amp's KZR ignores `blocks` when
     // state is "complete" / "aborted" and only updates the message
     // state. The accumulated content already lives in amp's buffer
@@ -3038,9 +3068,27 @@ async fn stream_anthropic_sse(
         return Ok(blocks);
     }
     if blocks.is_empty() {
-        anyhow::bail!("empty assistant response (no SSE blocks parsed)");
+        match stream_error {
+            Some(msg) => anyhow::bail!("upstream stream error: {msg}"),
+            None => anyhow::bail!("empty assistant response (no SSE blocks parsed)"),
+        }
     }
     Ok(blocks)
+}
+
+fn parse_buffered_message_blocks(buf: &str) -> Option<Vec<serde_json::Value>> {
+    let parsed: serde_json::Value = serde_json::from_str(buf.trim()).ok()?;
+    if parsed.get("type").and_then(|t| t.as_str()) != Some("message") {
+        return None;
+    }
+    let mut blocks = parsed.get("content")?.as_array()?.clone();
+    if blocks.is_empty() {
+        return None;
+    }
+    for block in blocks.iter_mut() {
+        ensure_tool_use_id(block);
+    }
+    Some(blocks)
 }
 
 /// Emits a single-block incremental delta targeting `block_index`.
@@ -4519,6 +4567,36 @@ mod tests {
         assert!(!is_valid_tu_id("XX-aB3cdEfghiJklmNopqrsTu"));
         assert!(!is_valid_tu_id("TU-aB3cdEfghiJklmNopqr-Tu"));
         assert!(!is_valid_tu_id(""));
+    }
+
+    #[test]
+    fn parse_buffered_message_blocks_salvages_mislabeled_json_body() {
+        let body = json!({
+            "id": "gen_x",
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "Hello"},
+                {"type": "tool_use", "id": "call_1", "name": "skill", "input": {"name": "x"}}
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 1, "output_tokens": 2}
+        })
+        .to_string();
+        let blocks = parse_buffered_message_blocks(&body).expect("salvages message JSON");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["text"].as_str().unwrap(), "Hello");
+        assert!(is_valid_tu_id(blocks[1]["id"].as_str().unwrap()));
+    }
+
+    #[test]
+    fn parse_buffered_message_blocks_rejects_non_message_bodies() {
+        assert!(parse_buffered_message_blocks("event: message_stop\n").is_none());
+        assert!(
+            parse_buffered_message_blocks(r#"{"type":"error","error":{"message":"boom"}}"#)
+                .is_none()
+        );
+        assert!(parse_buffered_message_blocks(r#"{"type":"message","content":[]}"#).is_none());
     }
 
     #[test]
